@@ -71,7 +71,7 @@ dsh plugin --profile web add <本仓库绝对路径>
 dsh plugin --profile web add dsh-code-audit
 
 # GitHub 源码
-dsh plugin --profile web add github:<owner>/dsh-code-audit
+dsh plugin --profile web add github:mlf519/dsh-code-audit
 ```
 
 安装后重新加载 DSH 配置并**重启客户端**，左侧导航栏会出现「代码审计」入口。
