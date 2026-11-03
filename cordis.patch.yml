@@ -1,0 +1,15 @@
+# dsh-code-audit bundle layer.
+# The plugin is a single self-contained package: SQLite storage, audit runner,
+# scheduler, agent tools, `/audit` command, and the web console served by the
+# host webServer under /dsh-code-audit.
+
+- insert:
+    - id: code-audit
+      name: dsh-code-audit
+      # Optional overrides:
+      # config:
+      #   dataDir: !!js dshHomePath('storages', 'code-audit')
+      #   maxConcurrentRuns: 2
+      #   runTimeoutMinutes: 60
+      #   defaultProvider: deepseek
+      #   defaultModel: deepseek-chat

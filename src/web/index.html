@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>代码审计控制台 · dsh-code-audit</title>
+  <link rel="icon" href="./favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">CA</span>
+        <div>
+          <h1>代码审计控制台</h1>
+          <p>DeepSeek Harness · dsh-code-audit</p>
+        </div>
+      </div>
+    </header>
+
+    <section class="stats" id="stats"></section>
+
+    <nav class="tabs" id="tabs">
+      <button class="tab active" data-tab="tasks" type="button">审计任务 <span class="count" id="count-tasks">0</span></button>
+      <button class="tab" data-tab="findings" type="button">漏洞管理 <span class="count" id="count-findings">0</span></button>
+      <button class="tab" data-tab="prompts" type="button">审计提示词 <span class="count" id="count-prompts">0</span></button>
+      <button class="tab" data-tab="runs" type="button">运行记录 <span class="count" id="count-runs">0</span></button>
+      <button class="tab" data-tab="settings" type="button">设置</button>
+    </nav>
+
+    <main id="panel" class="panel"></main>
+
+    <footer class="footer">
+      <span id="data-dir">数据目录加载中…</span>
+      <span class="dot">·</span>
+      <span>SQLite 主存储 + trajectory JSONL</span>
+    </footer>
+  </div>
+
+  <div class="overlay hidden" id="overlay">
+    <div class="modal" id="modal" role="dialog" aria-modal="true"></div>
+  </div>
+  <div class="toast hidden" id="toast"></div>
+
+  <script src="./app.js"></script>
+</body>
+</html>
