@@ -642,7 +642,16 @@ async function openTaskModal(task) {
         <div class="hint">本地绝对路径，Agent 将以该目录作为工作目录只读审计。</div>
       </div>
       <div class="field full"><label>任务说明</label><textarea name="description" rows="3" placeholder="关注的业务模块、已知风险点、审计边界…">${esc(task?.description ?? '')}</textarea></div>
-      <div class="field full"><label>漏洞审计提示词（只审计勾选的类型）</label><div class="prompt-list">${promptList}</div></div>
+      <div class="field full">
+        <div class="field-head">
+          <label>漏洞审计提示词（只审计勾选的类型）</label>
+          <div class="btn-group">
+            <button class="btn small" type="button" data-prompt-all>全选</button>
+            <button class="btn small ghost" type="button" data-prompt-none>取消全选</button>
+          </div>
+        </div>
+        <div class="prompt-list">${promptList}</div>
+      </div>
       <div class="field"><label>调度方式</label><select name="schedule_type">
         ${Object.entries(LABELS.schedule).map(([value, label]) => `<option value="${value}" ${scheduleType === value ? 'selected' : ''}>${label}</option>`).join('')}
       </select></div>
@@ -671,6 +680,14 @@ async function openTaskModal(task) {
         item.classList.toggle('selected', input.checked)
       })
     })
+    const setAllPrompts = checked => {
+      modal.querySelectorAll('.prompt-item').forEach(item => {
+        item.querySelector('input').checked = checked
+        item.classList.toggle('selected', checked)
+      })
+    }
+    modal.querySelector('[data-prompt-all]')?.addEventListener('click', () => setAllPrompts(true))
+    modal.querySelector('[data-prompt-none]')?.addEventListener('click', () => setAllPrompts(false))
 
     const repoInput = form.querySelector('[name="repo_path"]')
     const providerSelect = form.querySelector('#task-provider')
