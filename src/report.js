@@ -48,15 +48,16 @@ const COVERAGE_LABELS = {
 }
 
 /** Build an exportable audit report for one task. */
-export function buildTaskReport(store, taskId, format = 'markdown') {
+export function buildTaskReport(store, taskId, format = 'markdown', { type = 'standard' } = {}) {
   const task = store.getTask(taskId)
   if (!task) throw new Error('审计任务不存在')
+  const normalized = format === 'md' ? 'markdown' : format
+  const stamp = new Date().toISOString().slice(0, 10)
+  if (type === 'skill') return buildSkillReport(store, task, normalized, stamp)
   const runs = store.listRuns(taskId, 200)
   const findings = store.listFindings({ taskId })
   const coverage = buildCoverage(store, task, findings)
-  const meta = buildReportMeta(task, runs, findings)
-  const normalized = format === 'md' ? 'markdown' : format
-  const stamp = new Date().toISOString().slice(0, 10)
+  const meta = buildReportMeta(store, task, runs, findings)
   const baseName = `code-audit-report-${task.id.slice(-6)}-${stamp}`
 
   if (normalized === 'json') {
@@ -84,9 +85,8 @@ export function buildTaskReport(store, taskId, format = 'markdown') {
   }
 }
 
-/** Per-prompt audit coverage so partial runs still export clear empty sections. */
+/** Per-type audit coverage so partial runs still export clear empty sections. */
 function buildCoverage(store, task, findings) {
-  const prompts = task.prompt_ids.map(id => store.getPrompt(id)).filter(Boolean)
   const taskState = task.status === 'running'
     ? 'running'
     : task.status === 'completed'
@@ -94,6 +94,40 @@ function buildCoverage(store, task, findings) {
       : task.status === 'failed' || task.status === 'cancelled'
         ? 'partial'
         : 'pending'
+  if (task.audit_mode === 'skill') {
+    const skill = task.skill_id ? store.getSkill(task.skill_id) : undefined
+    if (!skill) {
+      return [{
+        id: task.skill_id,
+        name: '（审计 Skill 已删除）',
+        category: '',
+        severity: '',
+        findings: 0,
+        state: 'pending',
+        stateLabel: COVERAGE_LABELS.pending,
+        note: '任务引用的审计 Skill 已删除，请编辑任务重新选择',
+      }]
+    }
+    const count = findings.filter(finding => finding.skill_id === skill.id).length
+    const state = taskState === 'running' && count > 0 ? 'partial' : taskState
+    return [{
+      id: skill.id,
+      name: skill.name,
+      category: skill.category || '',
+      severity: '',
+      findings: count,
+      state,
+      stateLabel: COVERAGE_LABELS[state],
+      note: state === 'pending'
+        ? '该 Skill 尚未审计'
+        : count > 0
+          ? `已记录 ${count} 个漏洞`
+          : taskState === 'completed'
+            ? '已完成，未发现问题'
+            : '尚在审计或未完成，暂无发现',
+    }]
+  }
+  const prompts = task.prompt_ids.map(id => store.getPrompt(id)).filter(Boolean)
   return prompts.map(prompt => {
     const count = findings.filter(finding => finding.prompt_id === prompt.id).length
     let state = taskState
@@ -117,9 +151,11 @@ function buildCoverage(store, task, findings) {
   })
 }
 
-function buildReportMeta(task, runs, findings) {
+function buildReportMeta(store, task, runs, findings) {
   const generated = new Date()
   const latestRun = runs[0]
+  const auditMode = task.audit_mode === 'skill' ? 'skill' : 'prompts'
+  const skill = auditMode === 'skill' && task.skill_id ? store.getSkill(task.skill_id) : undefined
   const severityCounts = Object.fromEntries(
     SEVERITIES.map(severity => [severity, findings.filter(finding => finding.severity === severity).length]),
   )
@@ -136,7 +172,9 @@ function buildReportMeta(task, runs, findings) {
     description: task.description || '',
     status: task.status,
     statusLabel: TASK_STATUS_LABELS[task.status] ?? task.status,
-    promptCount: task.prompt_ids.length,
+    auditMode,
+    skillName: skill?.name ?? '',
+    promptCount: auditMode === 'skill' ? 1 : task.prompt_ids.length,
     total: findings.length,
     severityCounts,
     statusCounts,
@@ -182,11 +220,14 @@ function severitySummary(meta) {
 }
 
 function executiveSummary(meta) {
+  const scope = meta.auditMode === 'skill'
+    ? `本次审计按 Skill「${meta.skillName || '已删除的 Skill'}」执行`
+    : `本次审计覆盖 ${meta.promptCount} 个漏洞类型`
   if (meta.total === 0) {
-    return `本次审计覆盖 ${meta.promptCount} 个漏洞类型，未发现符合条件的安全问题。`
+    return `${scope}，未发现符合条件的安全问题。`
   }
   const parts = [
-    `本次审计覆盖 ${meta.promptCount} 个漏洞类型，共发现 ${meta.total} 个问题`,
+    `${scope}，共发现 ${meta.total} 个问题`,
     severitySummary(meta),
     `待确认 ${meta.statusCounts.open ?? 0} 个，已确认 ${meta.statusCounts.verified ?? 0} 个`,
   ]
@@ -213,6 +254,10 @@ function fmtDuration(start, end) {
   const minutes = Math.floor(seconds / 60)
   if (minutes < 60) return `${minutes} 分 ${pad(seconds % 60)} 秒`
   return `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分`
+}
+
+function coverageSeverityLabel(item) {
+  return item.severity ? SEVERITY_LABELS[item.severity] ?? item.severity : '—'
 }
 
 function escapeCell(value) {
@@ -242,7 +287,7 @@ function renderMarkdownReport(task, runs, findings, coverage, meta) {
   lines.push(`| 审计目录 | \`${escapeCell(task.repo_path)}\` |`)
   lines.push(`| 任务说明 | ${escapeCell(task.description || '—')} |`)
   lines.push(`| 任务状态 | ${escapeCell(meta.statusLabel)} |`)
-  lines.push(`| 审计类型 | ${meta.promptCount} 个 |`)
+  lines.push(`| 审计类型 | ${meta.auditMode === 'skill' ? `审计 Skill：${escapeCell(meta.skillName || '已删除')}` : `${meta.promptCount} 个`} |`)
   lines.push(`| 漏洞总数 | ${meta.total} 个 |`)
   lines.push(`| 最近运行 | ${meta.latestRun ? `${escapeCell(meta.latestRun.startedAt)}（${escapeCell(meta.latestRun.statusLabel)}，${escapeCell(meta.latestRun.duration)}）` : '暂无运行记录'} |`)
   if (task.next_run_at) lines.push(`| 下次执行 | ${escapeCell(fmtDate(task.next_run_at))} |`)
@@ -275,7 +320,9 @@ function renderMarkdownReport(task, runs, findings, coverage, meta) {
   lines.push('## 三、审计范围与方法')
   lines.push('')
   lines.push(`- 审计对象：\`${task.repo_path}\``)
-  lines.push(`- 审计方式：按任务启用的 ${meta.promptCount} 个漏洞审计提示词逐类执行，Agent 以只读方式访问代码目录。`)
+  lines.push(meta.auditMode === 'skill'
+    ? `- 审计方式：按审计 Skill「${meta.skillName || '已删除的 Skill'}」的规定执行，Agent 以只读方式访问代码目录。`
+    : `- 审计方式：按任务启用的 ${meta.promptCount} 个漏洞审计提示词逐类执行，Agent 以只读方式访问代码目录。`)
   lines.push('- 证据要求：每个漏洞均需给出代码位置、成因、触发路径与修复建议；可远程利用的漏洞应附 PoC 请求包。')
   if (meta.latestRun) {
     lines.push(`- 最近一次运行：${meta.latestRun.id}（${meta.latestRun.triggerLabel}，${meta.latestRun.startedAt} 至 ${meta.latestRun.finishedAt}，耗时 ${meta.latestRun.duration}）`)
@@ -289,7 +336,7 @@ function renderMarkdownReport(task, runs, findings, coverage, meta) {
   lines.push('| 审计类型 | 默认级别 | 状态 | 发现数 | 说明 |')
   lines.push('| --- | --- | --- | --- | --- |')
   for (const item of coverage) {
-    lines.push(`| ${escapeCell(item.name)} | ${SEVERITY_LABELS[item.severity] ?? item.severity} | ${escapeCell(item.stateLabel)} | ${item.findings} | ${escapeCell(item.note)} |`)
+    lines.push(`| ${escapeCell(item.name)} | ${escapeCell(coverageSeverityLabel(item))} | ${escapeCell(item.stateLabel)} | ${item.findings} | ${escapeCell(item.note)} |`)
   }
   if (coverage.length === 0) lines.push('| — | — | — | — | 未配置审计提示词 |')
   lines.push('')
@@ -405,7 +452,7 @@ function renderHtmlReport(task, runs, findings, coverage, meta) {
     .join('')
 
   const coverageRows = coverage.map(item =>
-    `<tr><td>${escapeHtml(item.name)}</td><td><span class="sev ${item.severity}">${SEVERITY_LABELS[item.severity] ?? escapeHtml(item.severity)}</span></td><td>${escapeHtml(item.stateLabel)}</td><td>${item.findings}</td><td>${escapeHtml(item.note)}</td></tr>`,
+    `<tr><td>${escapeHtml(item.name)}</td><td>${item.severity ? `<span class="sev ${escapeHtml(item.severity)}">${escapeHtml(SEVERITY_LABELS[item.severity] ?? item.severity)}</span>` : '—'}</td><td>${escapeHtml(item.stateLabel)}</td><td>${item.findings}</td><td>${escapeHtml(item.note)}</td></tr>`,
   ).join('') || '<tr><td colspan="5">未配置审计提示词</td></tr>'
 
   const runRows = runs.map(run =>
@@ -673,8 +720,8 @@ footer {
       <tbody>
         <tr><th>审计目录</th><td><code>${escapeHtml(task.repo_path)}</code></td></tr>
         <tr><th>任务说明</th><td>${escapeHtml(task.description || '—')}</td></tr>
-        <tr><th>审计类型</th><td>${meta.promptCount} 个漏洞审计提示词</td></tr>
-        <tr><th>审计方式</th><td>按启用的提示词逐类执行，Agent 以只读方式访问代码目录并收集证据</td></tr>
+        <tr><th>审计类型</th><td>${meta.auditMode === 'skill' ? `审计 Skill：${escapeHtml(meta.skillName || '已删除')}` : `${meta.promptCount} 个漏洞审计提示词`}</td></tr>
+        <tr><th>审计方式</th><td>${meta.auditMode === 'skill' ? `按审计 Skill「${escapeHtml(meta.skillName || '已删除')}」的规定执行，Agent 以只读方式访问代码目录并收集证据` : '按启用的提示词逐类执行，Agent 以只读方式访问代码目录并收集证据'}</td></tr>
         <tr><th>最近运行</th><td>${meta.latestRun ? `${escapeHtml(meta.latestRun.id)} · ${escapeHtml(meta.latestRun.triggerLabel)} · ${escapeHtml(meta.latestRun.startedAt)} 至 ${escapeHtml(meta.latestRun.finishedAt)} · 耗时 ${escapeHtml(meta.latestRun.duration)}` : '暂无运行记录'}</td></tr>
         ${task.next_run_at ? `<tr><th>下次执行</th><td>${escapeHtml(fmtDate(task.next_run_at))}</td></tr>` : ''}
       </tbody>
@@ -729,4 +776,227 @@ footer {
 </main>
 </body>
 </html>`
+}
+
+function reportError(message) {
+  const error = new Error(message)
+  error.status = 400
+  return error
+}
+
+/** Export the report the agent formatted according to the task's Skill. */
+function buildSkillReport(store, task, format, stamp) {
+  if (task.audit_mode !== 'skill') throw reportError('该任务不是 Skill 模式，无法导出 Skill 报告')
+  const skill = task.skill_id ? store.getSkill(task.skill_id) : undefined
+  const run = store.listRuns(task.id, 200).find(item => String(item.skill_report ?? '').trim())
+  if (!run) throw reportError('该任务还没有提交 Skill 报告，请先完成一次 Skill 模式审计')
+  const markdown = String(run.skill_report ?? '').trim()
+  const generated = new Date()
+  const baseName = `code-audit-skill-report-${task.id.slice(-6)}-${stamp}`
+
+  if (format === 'json') {
+    return {
+      filename: `${baseName}.json`,
+      mime: 'application/json; charset=utf-8',
+      content: JSON.stringify({
+        report: {
+          type: 'skill',
+          taskName: task.name,
+          skillName: skill?.name ?? '',
+          runId: run.id,
+          generatedAt: generated.toISOString(),
+        },
+        markdown,
+      }, null, 2),
+    }
+  }
+  if (format === 'html') {
+    return {
+      filename: `${baseName}.html`,
+      mime: 'text/html; charset=utf-8',
+      content: renderSkillHtmlReport(task, skill, run, markdown, generated),
+    }
+  }
+  return {
+    filename: `${baseName}.md`,
+    mime: 'text/markdown; charset=utf-8',
+    content: `${markdown}\n`,
+  }
+}
+
+function renderSkillHtmlReport(task, skill, run, markdown, generated) {
+  const skillName = skill?.name ?? task.name
+  const body = renderMarkdownToHtml(markdown)
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(task.name)} · ${escapeHtml(skillName)} 审计报告</title>
+<style>
+:root {
+  --ink: #1f2328;
+  --muted: #5b6573;
+  --line: #e3e8ef;
+  --soft: #f6f8fb;
+  --brand: #1a4fba;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: #eef2f7; color: var(--ink); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; line-height: 1.75; -webkit-font-smoothing: antialiased; }
+main { max-width: 980px; margin: 32px auto; background: #fff; border-radius: 14px; box-shadow: 0 18px 60px rgba(15, 23, 42, .12); overflow: hidden; }
+.cover { padding: 40px 48px 32px; color: #fff; background: radial-gradient(1200px 400px at 90% -10%, rgba(56, 189, 248, .28), transparent 60%), linear-gradient(135deg, #0b1b3a 0%, #12326b 55%, #1a4fba 100%); }
+.brand { font-size: 12px; letter-spacing: .18em; text-transform: uppercase; color: rgba(255,255,255,.7); }
+.cover h1 { margin: 14px 0 8px; font-size: 30px; line-height: 1.3; }
+.cover .sub { margin: 0; color: rgba(255,255,255,.78); font-size: 14px; }
+.cover-meta { margin-top: 22px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 28px; font-size: 13px; }
+.cover-meta div { display: flex; gap: 12px; border-bottom: 1px solid rgba(255,255,255,.14); padding-bottom: 7px; }
+.cover-meta span { color: rgba(255,255,255,.62); min-width: 64px; }
+.cover-meta b { font-weight: 600; overflow-wrap: anywhere; }
+.md { padding: 10px 48px 40px; }
+.md h1 { font-size: 24px; margin: 30px 0 12px; }
+.md h2 { font-size: 19px; margin: 30px 0 10px; padding-bottom: 6px; border-bottom: 1px solid var(--line); }
+.md h3 { font-size: 16px; margin: 22px 0 8px; }
+.md h4 { font-size: 14px; margin: 18px 0 6px; color: var(--muted); }
+.md p { margin: 9px 0; }
+.md ul, .md ol { margin: 8px 0; padding-left: 24px; }
+.md li { margin: 4px 0; }
+.md blockquote { margin: 12px 0; padding: 10px 16px; background: var(--soft); border-left: 3px solid var(--brand); border-radius: 0 8px 8px 0; color: #344054; }
+.md table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 13.5px; }
+.md th, .md td { border: 1px solid var(--line); padding: 8px 11px; text-align: left; vertical-align: top; }
+.md th { background: var(--soft); }
+.md pre { margin: 12px 0; padding: 14px 16px; border-radius: 9px; overflow: auto; background: #0f172a; color: #e2e8f0; font-size: 12.5px; line-height: 1.6; }
+.md code { font-family: "JetBrains Mono", Consolas, "Courier New", monospace; font-size: 12.5px; }
+.md p code, .md li code, .md td code, .md th code { background: var(--soft); color: var(--ink); padding: 1px 5px; border-radius: 4px; }
+.md hr { border: 0; border-top: 1px solid var(--line); margin: 24px 0; }
+footer { margin-top: 40px; padding: 18px 48px 26px; border-top: 1px solid var(--line); color: #98a2b3; font-size: 12px; display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+@media print {
+  body { background: #fff; }
+  main { margin: 0; max-width: none; border-radius: 0; box-shadow: none; }
+  .md, footer { padding-left: 8px; padding-right: 8px; }
+}
+@media (max-width: 720px) {
+  .cover, .md, footer { padding-left: 20px; padding-right: 20px; }
+  .cover-meta { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<main>
+  <header class="cover">
+    <div class="brand">DeepSeek Harness · Code Audit · Skill Report</div>
+    <h1>${escapeHtml(skillName)}</h1>
+    <p class="sub">${escapeHtml(task.name)} · ${escapeHtml(task.repo_path)}</p>
+    <div class="cover-meta">
+      <div><span>审计任务</span><b>${escapeHtml(task.name)}</b></div>
+      <div><span>所属 Skill</span><b>${escapeHtml(skillName)}</b></div>
+      <div><span>运行 ID</span><b class="mono">${escapeHtml(run.id)}</b></div>
+      <div><span>生成时间</span><b>${escapeHtml(fmtDate(generated.toISOString()))}</b></div>
+    </div>
+  </header>
+  <div class="md">${body}</div>
+  <footer>
+    <span>${escapeHtml(task.name)} · ${escapeHtml(skillName)}</span>
+    <span>由 dsh-code-audit 生成 · ${escapeHtml(fmtDate(generated.toISOString()))}</span>
+  </footer>
+</main>
+</body>
+</html>`
+}
+
+/** Minimal Markdown renderer for Skill-authored reports (no external deps). */
+function renderMarkdownToHtml(markdown) {
+  const lines = String(markdown ?? '').replace(/\r\n/g, '\n').split('\n')
+  const inline = text => escapeHtml(text)
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>')
+  const splitRow = row => row.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(cell => cell.trim())
+  const html = []
+  let index = 0
+  while (index < lines.length) {
+    const line = lines[index]
+    if (/^\s*```/.test(line)) {
+      const lang = line.replace(/^\s*```/, '').trim()
+      const code = []
+      index += 1
+      while (index < lines.length && !/^\s*```/.test(lines[index])) {
+        code.push(lines[index])
+        index += 1
+      }
+      index += 1
+      html.push(`<pre><code${lang ? ` class="lang-${escapeHtml(lang)}"` : ''}>${escapeHtml(code.join('\n'))}</code></pre>`)
+      continue
+    }
+    if (!line.trim()) {
+      index += 1
+      continue
+    }
+    if (/^\s*([-*_])\1{2,}\s*$/.test(line)) {
+      html.push('<hr>')
+      index += 1
+      continue
+    }
+    const heading = line.match(/^\s*(#{1,6})\s+(.*)$/)
+    if (heading) {
+      const level = heading[1].length
+      html.push(`<h${level}>${inline(heading[2])}</h${level}>`)
+      index += 1
+      continue
+    }
+    if (line.trim().startsWith('|') && index + 1 < lines.length && /^\s*\|?[\s:|-]+\|?\s*$/.test(lines[index + 1])) {
+      const header = splitRow(line)
+      index += 2
+      const rows = []
+      while (index < lines.length && lines[index].trim().startsWith('|')) {
+        rows.push(splitRow(lines[index]))
+        index += 1
+      }
+      html.push(`<table><thead><tr>${header.map(cell => `<th>${inline(cell)}</th>`).join('')}</tr></thead>`
+        + `<tbody>${rows.map(row => `<tr>${row.map(cell => `<td>${inline(cell)}</td>`).join('')}</tr>`).join('')}</tbody></table>`)
+      continue
+    }
+    if (/^\s*>\s?/.test(line)) {
+      const quote = []
+      while (index < lines.length && /^\s*>\s?/.test(lines[index])) {
+        quote.push(lines[index].replace(/^\s*>\s?/, ''))
+        index += 1
+      }
+      html.push(`<blockquote>${quote.map(text => inline(text)).join('<br>')}</blockquote>`)
+      continue
+    }
+    if (/^\s*[-*+]\s+/.test(line)) {
+      const items = []
+      while (index < lines.length && /^\s*[-*+]\s+/.test(lines[index])) {
+        items.push(lines[index].replace(/^\s*[-*+]\s+/, ''))
+        index += 1
+      }
+      html.push(`<ul>${items.map(item => `<li>${inline(item)}</li>`).join('')}</ul>`)
+      continue
+    }
+    if (/^\s*\d+[.)]\s+/.test(line)) {
+      const items = []
+      while (index < lines.length && /^\s*\d+[.)]\s+/.test(lines[index])) {
+        items.push(lines[index].replace(/^\s*\d+[.)]\s+/, ''))
+        index += 1
+      }
+      html.push(`<ol>${items.map(item => `<li>${inline(item)}</li>`).join('')}</ol>`)
+      continue
+    }
+    const paragraph = []
+    while (index < lines.length) {
+      const current = lines[index]
+      if (!current.trim() || /^\s*```/.test(current) || /^\s*(#{1,6})\s+/.test(current)
+        || /^\s*[-*+]\s+/.test(current) || /^\s*\d+[.)]\s+/.test(current)
+        || /^\s*>\s?/.test(current) || /^\s*([-*_])\1{2,}\s*$/.test(current)
+        || current.trim().startsWith('|')) break
+      paragraph.push(current)
+      index += 1
+    }
+    if (paragraph.length === 0) {
+      index += 1
+      continue
+    }
+    html.push(`<p>${paragraph.map(text => inline(text)).join('<br>')}</p>`)
+  }
+  return html.join('\n')
 }

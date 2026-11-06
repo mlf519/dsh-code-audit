@@ -32,6 +32,8 @@
 }
 
 * { box-sizing: border-box; }
+/* `.field` sets display:flex, which otherwise overrides the hidden attribute. */
+[hidden] { display: none !important; }
 body {
   margin: 0;
   background: var(--bg);
@@ -203,6 +205,32 @@ tbody tr:hover { background: var(--row-hover); }
 .prompt-card footer { display: flex; gap: 6px; flex-wrap: wrap; }
 .prompt-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
 
+.badge.skill { background: #e0eaff; color: #175cd3; }
+
+.mode-switch { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.mode-option {
+  display: flex; gap: 9px; padding: 11px 12px; border: 1px solid var(--line); border-radius: 9px;
+  cursor: pointer; background: var(--soft-bg);
+}
+.mode-option:hover { border-color: var(--line-strong); }
+.mode-option.active { border-color: var(--brand); background: var(--brand-soft); }
+.mode-option input { width: auto; margin: 3px 0 0; padding: 0; border: 0; background: transparent; }
+.mode-option span { display: flex; flex-direction: column; gap: 2px; }
+.mode-option b { font-size: 13px; }
+.mode-option small { color: var(--muted); font-size: 11.5px; line-height: 1.4; }
+
+.report-group { margin-top: 16px; padding: 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--soft-bg); display: flex; flex-direction: column; gap: 8px; }
+.report-group .group-head { font-size: 13px; font-weight: 600; }
+.report-group .hint { font-size: 11.5px; color: var(--muted); }
+
+.ref-list { display: flex; flex-direction: column; gap: 10px; }
+.ref-item { border: 1px solid var(--line); border-radius: 9px; padding: 10px; background: var(--soft-bg); display: flex; flex-direction: column; gap: 8px; }
+.ref-head { display: flex; gap: 8px; align-items: center; }
+.ref-head .ref-path { flex: 1; font-family: "JetBrains Mono", Consolas, monospace; font-size: 12.5px; }
+.ref-body { font-family: "JetBrains Mono", Consolas, monospace; font-size: 12.5px; min-height: 110px; }
+.ref-actions { margin-top: 8px; }
+.field textarea[name="skill_md"] { font-family: "JetBrains Mono", Consolas, monospace; font-size: 12.5px; }
+
 .modal { width: min(760px, calc(100vw - 40px)); max-height: calc(100vh - 80px); overflow-y: auto; background: var(--panel); border-radius: 14px; box-shadow: var(--modal-shadow); }
 .modal-head { display: flex; justify-content: space-between; align-items: center; padding: 18px 22px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--panel); z-index: 2; }
 .modal-head h2 { margin: 0; font-size: 17px; }
@@ -242,6 +270,7 @@ tbody tr:hover { background: var(--row-hover); }
 @media (max-width: 960px) {
   .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .form-grid { grid-template-columns: 1fr; }
+  .mode-switch { grid-template-columns: 1fr; }
   .app { padding: 16px; }
 }
 @media (max-width: 640px) {
@@ -303,4 +332,5 @@ tbody tr:hover { background: var(--row-hover); }
   .badge.cancelled { background: #262c34; color: #aab4c0; }
   .badge.manual { background: #2a313b; color: #cbd5e1; }
   .badge.once, .badge.cron, .badge.interval { background: #1d2f56; color: #a4c1ff; }
+  .badge.skill { background: #1d2f56; color: #a4c1ff; }
 }

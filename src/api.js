@@ -3,12 +3,20 @@ import { dirname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { buildTaskReport } from './report.js'
 import { buildState, createTask, updateTask } from './service.js'
-import { parsePromptsDocument, stringifyPromptsDocument } from './yaml.js'
+import { buildSkillFiles, groupSkillFiles, normaliseSkillInput } from './skillpack.js'
+import { removeSkillFromDsh, syncSkillToDsh } from './dshskills.js'
+import { createZip, readZip } from './zip.js'
+import {
+  parsePromptsDocument,
+  parseSkillsDocument,
+  stringifyPromptsDocument,
+  stringifySkillsDocument,
+} from './yaml.js'
 import { FINDING_STATUSES, SEVERITIES, normaliseSeverity } from './util.js'
 
 const WEB_ROOT = fileURLToPath(new URL('./web/', import.meta.url))
 const API_PREFIX = '/api/'
-const MAX_BODY_BYTES = 4 * 1024 * 1024
+const MAX_BODY_BYTES = 16 * 1024 * 1024
 
 const STATIC_FILES = {
   'index.html': 'text/html; charset=utf-8',
@@ -18,10 +26,10 @@ const STATIC_FILES = {
 }
 
 /** Create the HTTP handler for the console and its REST API. */
-export function createApiHandler({ store, runner, scheduler, dataDir, listModels }) {
+export function createApiHandler({ store, runner, scheduler, dataDir, listModels, invalidateSkills = () => {} }) {
   const reportsDir = join(dataDir, 'reports')
   mkdirSync(reportsDir, { recursive: true })
-  const context = { store, runner, scheduler, dataDir, reportsDir, listModels }
+  const context = { store, runner, scheduler, dataDir, reportsDir, listModels, invalidateSkills }
 
   return async function handleRequest(req, res) {
     try {
@@ -85,6 +93,11 @@ async function handleApi(req, res, url, route, context) {
     return
   }
 
+  if (resource === 'skills') {
+    await handleSkills(req, res, segments, context)
+    return
+  }
+
   if (resource === 'findings') {
     await handleFindings(req, res, segments, context)
     return
@@ -107,6 +120,16 @@ async function handleApi(req, res, url, route, context) {
         const value = Number(body.runTimeoutMinutes)
         if (!Number.isFinite(value) || value < 0) throw httpError(400, '超时时间必须为非负数字')
         store.setSetting('runTimeoutMinutes', Math.floor(value))
+      }
+      if (body.llmRetryDelayMinutes !== undefined) {
+        const value = Number(body.llmRetryDelayMinutes)
+        if (!Number.isFinite(value) || value < 0 || value > 1440) throw httpError(400, '自动续跑间隔必须为 0–1440 分钟')
+        store.setSetting('llmRetryDelayMinutes', Math.floor(value))
+      }
+      if (body.llmRetryCount !== undefined) {
+        const value = Number(body.llmRetryCount)
+        if (!Number.isFinite(value) || value < 0 || value > 100) throw httpError(400, '自动续跑次数必须为 0–100')
+        store.setSetting('llmRetryCount', Math.floor(value))
       }
       if (body.defaultProvider !== undefined) store.setSetting('defaultProvider', String(body.defaultProvider).trim())
       if (body.defaultModel !== undefined) store.setSetting('defaultModel', String(body.defaultModel).trim())
@@ -172,7 +195,10 @@ async function handleTasks(req, res, url, segments, context) {
   }
   if (method === 'GET' && action === 'report') {
     const format = (url.searchParams.get('format') ?? 'markdown').toLowerCase()
-    const report = buildTaskReport(store, id, format)
+    const reportType = (url.searchParams.get('type') ?? 'standard').toLowerCase()
+    const report = buildTaskReport(store, id, format, {
+      type: reportType === 'skill' ? 'skill' : 'standard',
+    })
     try {
       writeFileSync(join(reportsDir, report.filename), report.content)
     } catch {
@@ -272,6 +298,196 @@ async function handlePrompts(req, res, segments, context) {
     return
   }
   throw httpError(404, '接口不存在')
+}
+
+async function handleSkills(req, res, segments, context) {
+  const { store, invalidateSkills } = context
+  const method = req.method ?? 'GET'
+  const id = segments[1]
+  const action = segments[2]
+
+  if (method === 'GET' && segments.length === 1) {
+    sendJson(res, 200, { skills: store.listSkills() })
+    return
+  }
+  if (method === 'GET' && id === 'export' && action === 'zip') {
+    sendZip(res, buildAllSkillsArchive(store), `audit-skills-${stampNow()}.zip`)
+    return
+  }
+  if (method === 'GET' && id === 'export') {
+    const skills = store.listSkills()
+    res.writeHead(200, {
+      'Content-Type': 'application/yaml; charset=utf-8',
+      'Content-Disposition': `attachment; filename="audit-skills-${stampNow()}.yml"`,
+      'Cache-Control': 'no-store',
+    })
+    res.end(stringifySkillsDocument(skills))
+    return
+  }
+  if (method === 'GET' && action === 'export') {
+    const skill = store.getSkill(id)
+    if (!skill) throw httpError(404, 'Skill 不存在')
+    sendZip(res, createZip(buildSkillFiles(skill)), `${slugify(skill.name)}-${stampNow()}.zip`)
+    return
+  }
+  if (method === 'GET' && segments.length === 2) {
+    const skill = store.getSkill(id)
+    if (!skill) throw httpError(404, 'Skill 不存在')
+    sendJson(res, 200, { skill })
+    return
+  }
+  if (method === 'POST' && id === 'import') {
+    const body = await readJsonBody(req)
+    const records = parseSkillsDocument(body.yaml ?? '')
+    if (records.length === 0) throw httpError(400, '备份文件中没有有效的 Skill')
+    let created = 0
+    let updated = 0
+    let dshSynced = 0
+    for (const record of records) {
+      const result = store.upsertSkillByName(record)
+      if (result.created) created += 1
+      else updated += 1
+      if (syncSkillMirror(result.skill, invalidateSkills).synced) dshSynced += 1
+    }
+    sendJson(res, 200, { created, updated, total: records.length, dsh_synced: dshSynced })
+    return
+  }
+  if (method === 'POST' && id === 'import-files') {
+    const body = await readJsonBody(req)
+    const files = Array.isArray(body.files) ? body.files : []
+    if (files.length === 0) throw httpError(400, '没有收到要导入的文件')
+    const groups = groupSkillFiles(files)
+    const result = importSkillGroups(store, groups, invalidateSkills)
+    sendJson(res, 200, result)
+    return
+  }
+  if (method === 'POST' && id === 'import-zip') {
+    const body = await readJsonBody(req)
+    const base64 = String(body.zip ?? body.data ?? '').replace(/^data:[^,]*,/, '')
+    if (!base64) throw httpError(400, '没有收到 ZIP 文件内容')
+    let buffer
+    try {
+      buffer = Buffer.from(base64, 'base64')
+    } catch {
+      throw httpError(400, 'ZIP 文件内容不是合法的 Base64')
+    }
+    const files = readZip(buffer)
+    if (files.length === 0) throw httpError(400, 'ZIP 中没有可读取的文本文件')
+    const groups = groupSkillFiles(files)
+    const result = importSkillGroups(store, groups, invalidateSkills)
+    sendJson(res, 200, result)
+    return
+  }
+  if (method === 'POST' && segments.length === 1) {
+    const body = await readJsonBody(req)
+    const fields = normaliseSkillInput(body)
+    if (store.getSkillByName(fields.name)) throw httpError(400, '同名 Skill 已存在')
+    const skill = store.createSkill({ ...fields, builtin: false })
+    sendJson(res, 201, { skill, dsh: syncSkillMirror(skill, invalidateSkills) })
+    return
+  }
+  if (method === 'PUT' && segments.length === 2) {
+    const body = await readJsonBody(req)
+    const current = store.getSkill(id)
+    if (!current) throw httpError(404, 'Skill 不存在')
+    const fields = normaliseSkillInput(body, current)
+    if (!fields.name) throw httpError(400, 'Skill 名称不能为空')
+    const duplicate = store.getSkillByName(fields.name)
+    if (duplicate && duplicate.id !== id) throw httpError(400, '同名 Skill 已存在')
+    const skill = store.updateSkill(id, fields)
+    sendJson(res, 200, { skill, dsh: syncSkillMirror(skill, invalidateSkills) })
+    return
+  }
+  if (method === 'DELETE' && segments.length === 2) {
+    const skill = store.getSkill(id)
+    if (!skill) throw httpError(404, 'Skill 不存在')
+    removeSkillFromDsh(skill)
+    // Drop the mirrored `/skill-name` from DSH's catalog right away instead of
+    // waiting for the file watcher (a directory removal is not seen by it).
+    invalidateSkills()
+    store.deleteSkill(id)
+    sendJson(res, 200, { deleted: true })
+    return
+  }
+  throw httpError(404, '接口不存在')
+}
+
+/** Import parsed SKILL.md packages by name, updating existing skills in place. */
+function importSkillGroups(store, groups, invalidate = () => {}) {
+  if (!Array.isArray(groups) || groups.length === 0) throw httpError(400, '没有找到可导入的 SKILL.md')
+  let created = 0
+  let updated = 0
+  let dshSynced = 0
+  const imported = []
+  for (const group of groups) {
+    let fields
+    try {
+      fields = normaliseSkillInput({
+        skill_md: group.skill_md,
+        references: group.references,
+      })
+    } catch (error) {
+      throw httpError(Number(error?.status) || 400, String(error?.message ?? error))
+    }
+    const result = store.upsertSkillByName({ ...fields, builtin: false })
+    if (result.created) created += 1
+    else updated += 1
+    if (syncSkillMirror(result.skill, invalidate).synced) dshSynced += 1
+    imported.push({ id: result.skill.id, name: result.skill.name })
+  }
+  return { created, updated, total: groups.length, skills: imported, dsh_synced: dshSynced }
+}
+
+/** Mirror a skill into DSH; failures must never break the import/save request. */
+function syncSkillMirror(skill, invalidate = () => {}) {
+  try {
+    const result = syncSkillToDsh(skill)
+    // Disabling a skill removes its mirror inside sync, so refresh either way.
+    invalidate()
+    return result
+  } catch (error) {
+    return { synced: false, reason: 'io-error', error: String(error?.message ?? error) }
+  }
+}
+
+function buildAllSkillsArchive(store) {
+  const skills = store.listSkills()
+  if (skills.length === 0) throw httpError(400, '没有可导出的 Skill')
+  const entries = []
+  const usedNames = new Set()
+  for (const skill of skills) {
+    let slug = slugify(skill.name)
+    if (usedNames.has(slug)) slug = `${slug}-${skill.id.slice(-4)}`
+    usedNames.add(slug)
+    for (const file of buildSkillFiles(skill)) {
+      entries.push({ path: `${slug}/${file.path}`, content: file.content })
+    }
+  }
+  return createZip(entries)
+}
+
+function sendZip(res, buffer, filename) {
+  const fallback = filename.replace(/[^\x20-\x7e]/g, '_').replace(/"/g, '')
+  res.writeHead(200, {
+    'Content-Type': 'application/zip',
+    'Content-Disposition': `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(filename)}`,
+    'Content-Length': buffer.length,
+    'Cache-Control': 'no-store',
+  })
+  res.end(buffer)
+}
+
+function slugify(name) {
+  const slug = String(name ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+  return slug || 'skill'
+}
+
+function stampNow() {
+  return new Date().toISOString().slice(0, 10)
 }
 
 async function handleFindings(req, res, segments, context) {

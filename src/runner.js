@@ -2,6 +2,8 @@ import { createHash, randomUUID } from 'node:crypto'
 import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { rescheduleAfterRun } from './schedule.js'
+import { findDshSkillMirror, invalidateDshSkills, syncSkillToDsh } from './dshskills.js'
+import { resolveReportGuide, skillPromptContent } from './skillpack.js'
 import { clip, nowIso } from './util.js'
 
 /** Drives audit runs by creating isolated DSH agent sessions. */
@@ -39,6 +41,131 @@ export class AuditRunner {
   }
 
   /**
+   * Return the live DSH mirror for a skill, re-creating it when missing. A user
+   * may uninstall the mirrored skill from the DSH skill center, which would
+   * otherwise force every audit to fall back to inlining the whole skill text.
+   */
+  ensureSkillMirror(skill) {
+    const existing = findDshSkillMirror(skill)
+    if (existing) return existing
+    const result = syncSkillToDsh(skill)
+    if (!result.synced) return null
+    invalidateDshSkills(this.ctx)
+    return findDshSkillMirror(skill) ?? { name: result.name, dir: result.dir }
+  }
+
+  /** (Re)arm the overall run timeout for a live agent. */
+  armTimeout(runId, handle) {
+    const entry = this.active.get(runId)
+    if (!entry) return
+    if (entry.timeout) {
+      clearTimeout(entry.timeout)
+      entry.timeout = null
+    }
+    const timeoutMinutes = Number(
+      this.store.getSetting('runTimeoutMinutes', this.config.runTimeoutMinutes ?? 60),
+    )
+    if (!TimeoutValid(timeoutMinutes)) return
+    entry.timeout = setTimeout(() => {
+      try {
+        handle.agent.cancel({ kind: 'user' })
+      } catch {
+        // ignore
+      }
+      this.finish(runId, { cancelled: true, error: `审计超时（${timeoutMinutes} 分钟）` })
+    }, timeoutMinutes * 60_000)
+    entry.timeout.unref?.()
+  }
+
+  /** Wait for the agent to become idle, then either continue or finish. */
+  watchIdle(runId) {
+    const entry = this.active.get(runId)
+    if (!entry) return
+    entry.handle.agent.whenIdle().then(
+      () => this.handleIdle(runId),
+      error => {
+        const current = this.active.get(runId)
+        if (!current) return
+        current.error = String(error?.message ?? error)
+        this.handleIdle(runId)
+      },
+    )
+  }
+
+  handleIdle(runId) {
+    const entry = this.active.get(runId)
+    if (!entry) return
+    if (entry.cancelRequested) {
+      this.finish(runId, { cancelled: true })
+      return
+    }
+    if (!entry.error) {
+      this.finish(runId)
+      return
+    }
+    this.scheduleRetry(runId, entry.error)
+  }
+
+  /**
+   * A model reply failed (timeout, network error, 5xx...). Keep the run alive
+   * and send a "continue" message after the configured delay, up to the
+   * configured number of recoveries; only then mark the run as failed.
+   */
+  scheduleRetry(runId, error) {
+    const entry = this.active.get(runId)
+    if (!entry) return
+    const limit = RetryCount(this.store.getSetting('llmRetryCount', this.config.llmRetryCount ?? 3))
+    if (entry.retries >= limit) {
+      this.finish(runId, { error })
+      return
+    }
+    const delay = RetryMinutes(
+      this.store.getSetting('llmRetryDelayMinutes', this.config.llmRetryDelayMinutes ?? 5),
+    )
+    const next = entry.retries + 1
+    entry.error = null
+    entry.progress.stage = '等待续跑'
+    entry.progress.note = `${delay > 0 ? `${delay} 分钟后` : '立即'}自动续跑（第 ${next}/${limit} 次）：${clip(error, 160)}`
+    entry.progress.percent = Math.max(entry.progress.percent ?? 0, 10)
+    this.persistProgress(runId)
+    // The overall timeout must not fire while we intentionally wait to resume.
+    if (entry.timeout) {
+      clearTimeout(entry.timeout)
+      entry.timeout = null
+    }
+    entry.retryTimer = setTimeout(() => {
+      const current = this.active.get(runId)
+      if (!current) return
+      current.retryTimer = null
+      if (current.cancelRequested) {
+        this.finish(runId, { cancelled: true })
+        return
+      }
+      current.retries = next
+      current.error = null
+      current.progress.stage = '继续审计'
+      current.progress.note = `自动续跑第 ${next}/${limit} 次（上次失败：${clip(error, 120)}）`
+      this.persistProgress(runId)
+      try {
+        current.handle.agent.followup(current.createUserMessage({
+          content: [{
+            type: 'text',
+            text: '继续。上一次模型回复失败或中断，请从中断处继续完成审计任务，不要重复已经完成的工作。',
+          }],
+          source: { kind: 'user' },
+        }))
+      } catch (retryError) {
+        current.error = String(retryError?.message ?? retryError)
+        this.scheduleRetry(runId, current.error)
+        return
+      }
+      this.armTimeout(runId, current.handle)
+      this.watchIdle(runId)
+    }, delay * 60_000)
+    entry.retryTimer.unref?.()
+  }
+
+  /**
    * Resolve provider/model for a run: the task selection wins, then the plugin
    * default, then the DSH default model used by normal client sessions.
    */
@@ -72,10 +199,21 @@ export class AuditRunner {
     if (this.isRunning(taskId)) throw new Error('该任务已有正在运行的审计')
     if (this.active.size >= this.limit()) throw new Error('已达到最大并发审计数，请稍后再试')
 
-    const selectedPrompts = task.prompt_ids
-      .map(id => this.store.getPrompt(id))
-      .filter(prompt => prompt && prompt.enabled)
-    if (selectedPrompts.length === 0) throw new Error('请先为任务选择至少一条启用的漏洞审计提示词')
+    const auditMode = task.audit_mode === 'skill' ? 'skill' : 'prompts'
+    const skill = auditMode === 'skill'
+      ? (task.skill_id ? this.store.getSkill(task.skill_id) : undefined)
+      : undefined
+    const selectedPrompts = auditMode === 'skill'
+      ? []
+      : task.prompt_ids.map(id => this.store.getPrompt(id)).filter(prompt => prompt && prompt.enabled)
+    if (auditMode === 'skill') {
+      if (!skill) throw new Error('任务选择的审计 Skill 不存在，请编辑任务重新选择')
+      if (!skill.enabled) throw new Error(`审计 Skill 已禁用：${skill.name}`)
+    } else if (selectedPrompts.length === 0) {
+      throw new Error('请先为任务选择至少一条启用的漏洞审计提示词')
+    }
+    const auditUnits = auditMode === 'skill' ? 1 : selectedPrompts.length
+    const unitNames = auditMode === 'skill' ? [skill.name] : selectedPrompts.map(prompt => prompt.name)
 
     const selection = this.resolveSelection(task)
     if (!selection.provider || !selection.model) {
@@ -129,17 +267,21 @@ export class AuditRunner {
         summary: '',
         cancelRequested: false,
         timeout: null,
+        retryTimer: null,
+        retries: 0,
+        createUserMessage,
         error: null,
         progressTimer: null,
-        promptNames: selectedPrompts.map(prompt => prompt.name),
+        promptNames: unitNames,
         donePrompts: [],
+        auditMode,
         progress: {
           percent: 5,
           stage: '初始化',
           note: '已创建审计会话，等待 Agent 开始',
           prompt: '',
           done: 0,
-          total: selectedPrompts.length,
+          total: auditUnits,
           steps: 0,
           toolCalls: 0,
           findings: 0,
@@ -149,37 +291,27 @@ export class AuditRunner {
       this.sessionRuns.set(sessionId, run.id)
       this.persistProgress(run.id)
 
+      // Skill mode prefers a native `/skill-name` invocation. Re-mirror first
+      // when the mirror is missing (e.g. uninstalled via the DSH skill center),
+      // otherwise the prompt has to carry the whole skill text inline.
+      const skillMirror = auditMode === 'skill' ? this.ensureSkillMirror(skill) : null
       const message = createUserMessage({
-        content: [{ type: 'text', text: buildAuditPrompt(task, selectedPrompts) }],
+        content: [{
+          type: 'text',
+          text: auditMode === 'skill' ? buildSkillAuditPrompt(task, skill, skillMirror) : buildAuditPrompt(task, selectedPrompts),
+        }],
         source: { kind: 'user' },
       })
       handle.agent.followup(message)
 
-      const timeoutMinutes = Number(
-        this.store.getSetting('runTimeoutMinutes', this.config.runTimeoutMinutes ?? 60),
-      )
-      if (TimeoutValid(timeoutMinutes)) {
-        const entry = this.active.get(run.id)
-        entry.timeout = setTimeout(() => {
-          try {
-            handle.agent.cancel({ kind: 'user' })
-          } catch {
-            // ignore
-          }
-          this.finish(run.id, { cancelled: true, error: `审计超时（${timeoutMinutes} 分钟）` })
-        }, timeoutMinutes * 60_000)
-        entry.timeout.unref?.()
-      }
-
-      handle.agent.whenIdle().then(
-        () => this.finish(run.id),
-        error => this.finish(run.id, { error: String(error?.message ?? error) }),
-      )
+      this.armTimeout(run.id, handle)
+      this.watchIdle(run.id)
     } catch (error) {
       // Drop any half-initialized entry so later runs are not blocked.
       const partial = this.active.get(run.id)
       if (partial) {
         if (partial.timeout) clearTimeout(partial.timeout)
+        if (partial.retryTimer) clearTimeout(partial.retryTimer)
         if (partial.progressTimer) clearTimeout(partial.progressTimer)
         this.active.delete(run.id)
         this.sessionRuns.delete(sessionId)
@@ -200,7 +332,7 @@ export class AuditRunner {
           stage: '失败',
           note: clip(error?.message ?? error, 300),
           done: 0,
-          total: selectedPrompts.length,
+          total: auditUnits,
           steps: 0,
           toolCalls: 0,
           findings: 0,
@@ -219,6 +351,12 @@ export class AuditRunner {
     const entry = this.active.get(runId)
     if (!entry) throw new Error('该运行已结束')
     entry.cancelRequested = true
+    if (entry.retryTimer) {
+      clearTimeout(entry.retryTimer)
+      entry.retryTimer = null
+      this.finish(runId, { cancelled: true })
+      return
+    }
     try {
       entry.handle.agent.cancel({ kind: 'user' })
     } catch {
@@ -264,9 +402,8 @@ export class AuditRunner {
         entry.progress.stage = '失败'
         entry.progress.note = clip(message, 200)
         this.persistProgress(runId)
-        // whenIdle resolves for failed turns too; finalize immediately so the
-        // console does not report a broken turn as a completed audit.
-        setTimeout(() => this.finish(runId, { error: message }), 0)
+        // `whenIdle` resolves for failed turns too; idle handling decides
+        // whether to auto-continue or fail the run.
       }
     }
   }
@@ -351,8 +488,14 @@ export class AuditRunner {
     const filePath = String(input.file_path ?? '').replaceAll('\\', '/')
     const lineStart = Number.isFinite(Number(input.line_start)) ? Number(input.line_start) : null
     const lineEnd = Number.isFinite(Number(input.line_end)) ? Number(input.line_end) : lineStart
-    const prompt = input.prompt_name ? this.store.getPromptByName(input.prompt_name) : undefined
-    const promptId = prompt?.id ?? task.prompt_ids[0] ?? null
+    const skill = task.audit_mode === 'skill' && task.skill_id ? this.store.getSkill(task.skill_id) : undefined
+    const prompt = skill
+      ? undefined
+      : input.prompt_name
+        ? this.store.getPromptByName(input.prompt_name)
+        : undefined
+    const promptId = skill ? null : prompt?.id ?? task.prompt_ids[0] ?? null
+    const skillId = skill?.id ?? null
     const fingerprint = createHash('sha256')
       .update(`${context.taskId}|${filePath}|${lineStart ?? ''}|${title.toLowerCase()}`)
       .digest('hex')
@@ -360,9 +503,10 @@ export class AuditRunner {
     const result = this.store.addFinding(context.taskId, {
       run_id: context.runId,
       prompt_id: promptId,
+      skill_id: skillId,
       title,
       severity: input.severity,
-      category: input.category || prompt?.category || '',
+      category: input.category || prompt?.category || skill?.category || '',
       file_path: filePath,
       line_start: lineStart,
       line_end: lineEnd,
@@ -380,6 +524,26 @@ export class AuditRunner {
       this.touchProgress(context.runId)
     }
     return result
+  }
+
+  /** Store a report the agent formatted according to the task's Skill. */
+  submitSkillReport(context, content) {
+    const task = this.store.getTask(context.taskId)
+    if (!task || task.audit_mode !== 'skill') throw new Error('只有 Skill 模式的审计任务可以提交 Skill 报告')
+    const skill = task.skill_id ? this.store.getSkill(task.skill_id) : undefined
+    const reportGuide = String(skill?.report_guide ?? '').trim()
+      || resolveReportGuide(skill?.references ?? [])
+    if (!skill || !reportGuide) throw new Error('当前审计 Skill 没有规定报告格式')
+    const text = String(content ?? '').trim()
+    if (!text) throw new Error('Skill 报告内容不能为空')
+    this.store.updateRun(context.runId, { skill_report: clip(text, 200000) })
+    const entry = this.active.get(context.runId)
+    if (entry) {
+      entry.progress.stage = '报告'
+      entry.progress.percent = Math.max(entry.progress.percent ?? 0, 98)
+      entry.progress.note = '已提交 Skill 报告，等待会话结束'
+      this.persistProgress(context.runId)
+    }
   }
 
   /** Store the agent's run summary. */
@@ -401,6 +565,7 @@ export class AuditRunner {
     this.active.delete(runId)
     this.sessionRuns.delete(entry.sessionId)
     if (entry.timeout) clearTimeout(entry.timeout)
+    if (entry.retryTimer) clearTimeout(entry.retryTimer)
     if (entry.progressTimer) clearTimeout(entry.progressTimer)
 
     const run = this.store.getRun(runId)
@@ -485,6 +650,7 @@ export class AuditRunner {
   dispose() {
     for (const [runId, entry] of this.active) {
       if (entry.timeout) clearTimeout(entry.timeout)
+      if (entry.retryTimer) clearTimeout(entry.retryTimer)
       if (entry.progressTimer) clearTimeout(entry.progressTimer)
       try {
         entry.handle.agent.cancel({ kind: 'disposed' })
@@ -517,6 +683,20 @@ export class AuditRunner {
 
 function TimeoutValid(value) {
   return Number.isFinite(value) && value > 0
+}
+
+/** Auto-continue delay in minutes, clamped to the 24h ceiling. */
+function RetryMinutes(value) {
+  const minutes = Number(value)
+  if (!Number.isFinite(minutes) || minutes <= 0) return 0
+  return Math.min(1440, Math.floor(minutes))
+}
+
+/** How many times a failed model reply may be auto-continued. */
+function RetryCount(value) {
+  const count = Number(value)
+  if (!Number.isFinite(count) || count <= 0) return 0
+  return Math.min(100, Math.floor(count))
 }
 
 /** Session titles are limited to 120 bytes in the client. */
@@ -596,5 +776,76 @@ ${sections.join('\n\n')}
 - prompt_name：命中的审计提示词名称（例如 "${prompts[0]?.name ?? ''}"）
 
 全部审计完成后，调用工具 \`code_audit_submit_summary\` 输出本次审计总结：已覆盖的漏洞类型、发现数量、未发现问题的类型及原因。
+如果本次没有任何发现，也必须调用 \`code_audit_submit_summary\` 说明"未发现符合条件的问题"，不要直接结束。`
+}
+
+/** Compose the audit instruction for a task driven by a code audit Skill. */
+export function buildSkillAuditPrompt(task, skill, mirror = null) {
+  const reportGuide = String(skill.report_guide ?? '').trim()
+  const native = Boolean(mirror?.name)
+  const skillSection = native
+    ? `# Skill 调用（必须遵守）
+本次任务使用 DSH 原生 Skill：/${mirror.name}
+该 Skill 的 SKILL.md 正文由 DSH 加载；其中提到的 references/ 文件请按需读取 ${mirror.dir} 下的对应路径，不要跳过。
+如果 DSH 未自动加载该 Skill，请直接读取 ${join(mirror.dir, 'SKILL.md')} 作为审计规定。`
+    : `# Skill 规定（必须遵守）
+${skillPromptContent(skill) || '（该 Skill 未提供具体审计规定）'}`
+  const reportSection = reportGuide
+    ? `
+# Skill 报告（必须提交）
+本次审计结束后，必须调用工具 \`code_audit_submit_skill_report\` 提交一份完整报告，content 参数为 Markdown 文本。
+报告必须严格遵循该 Skill 规定的格式：
+
+${reportGuide}
+`
+    : ''
+  const reportRequirement = reportGuide
+    ? '- 结束前调用 `code_audit_submit_skill_report`，按 Skill 规定的报告格式提交 Markdown 报告。'
+    : '- 该 Skill 未规定报告格式，无需提交 Skill 报告。'
+  const callLine = native ? `/${mirror.name}\n\n` : ''
+
+  return `${callLine}你是一名资深代码安全审计工程师，正在按照指定的审计 Skill 执行一个自动化的代码审计任务。
+
+# 任务信息
+- 任务名称：${task.name}
+- 审计目录：${task.repo_path}
+- 任务说明：${task.description || '（无）'}
+
+# 审计 Skill
+- 名称：${skill.name}
+- 分类：${skill.category || '未分类'}
+- 说明：${skill.description || '（无）'}
+
+${skillSection}
+
+# 审计范围约束
+- 严格按照该 Skill 规定的审计范围、检查项与判定标准执行；Skill 未要求的内容不要审计、不要报告。
+- 必须使用只读方式查看代码，禁止修改、创建、删除仓库中的任何文件，禁止执行会产生副作用的命令。
+- 如果 Skill 要求把报告写入被审计项目的某个目录（例如 reports/），不要创建文件；改为通过 \`code_audit_submit_skill_report\` 提交完整报告内容。
+- 所有文件路径使用相对审计目录的路径，禁止使用绝对路径。
+- 只报告有明确代码证据的问题；不确定、无法定位到具体代码的猜测不要上报。
+
+# 进度上报（必须遵守）
+- 开始审计前，调用工具 \`code_audit_report_progress\`，参数 prompt_name 为 "${skill.name}"，status 为 started。
+- 审计完成后再次调用，status 为 done，note 用一句话说明结果，例如"已检查 18 个文件，发现 2 个问题"。
+
+# 上报方式（必须遵守）
+每确认一个漏洞，调用工具 \`code_audit_submit_finding\`，参数含义：
+- title：简短明确的漏洞标题
+- severity：critical / high / medium / low / info 之一
+- category：漏洞分类
+- file_path：相对路径
+- line_start / line_end：证据代码所在行号（整数）
+- code_snippet：关键代码片段（不超过 20 行）
+- description：漏洞成因与影响
+- evidence：可复现的触发路径或数据流（source → sink）
+- recommendation：具体修复建议
+- poc_request：可利用漏洞必须提供 PoC 请求包示例。包含（1）原始 HTTP 请求：请求行、Host、必要的 Cookie/Token/Content-Type 等 Header、Body；（2）一条把同一请求写成可直接执行的 curl 命令。仅当漏洞无法通过 HTTP 触发（如本地条件、需依赖内部状态）时留空，并在 evidence 中说明复现步骤。
+- prompt_name：Skill 模式下无需填写。
+
+${reportSection}
+# 结束要求
+- 调用 \`code_audit_submit_summary\` 输出本次审计总结：Skill 覆盖范围、发现数量、未覆盖或未发现问题的原因。
+${reportRequirement}
 如果本次没有任何发现，也必须调用 \`code_audit_submit_summary\` 说明"未发现符合条件的问题"，不要直接结束。`
 }

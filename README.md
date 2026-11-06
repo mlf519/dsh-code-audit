@@ -1,14 +1,15 @@
 # dsh-code-audit
 
-DeepSeek Harness（DSH）代码审计插件：用任务化的方式管理代码审计，按所选漏洞提示词驱动 DSH 原生 Agent 会话进行审计，沉淀漏洞、进度与运行轨迹，并导出可直接交付的专业审计报告。
+DeepSeek Harness（DSH）代码审计插件：用任务化的方式管理代码审计，可按所选漏洞提示词或审计 Skill 驱动 DSH 原生 Agent 会话进行审计，沉淀漏洞、进度与运行轨迹，并导出可直接交付的专业审计报告。
 
-当前版本：**0.1.6** ｜ 兼容 DSH `>=0.1.1-rc.2 <0.3.0`（含 0.2.x）
+当前版本：**0.4.0** ｜ 兼容 DSH `>=0.1.1-rc.2 <0.3.0`（含 0.2.x）
 
 ## 功能特性
 
 ### 审计任务
 
-- 新建、修改、删除、启用 / 暂停审计任务，指定代码目录、任务说明与启用的漏洞提示词。
+- 新建、修改、删除、启用 / 暂停审计任务，指定代码目录、任务说明与审计范围。
+- **两种审计模式**：`按漏洞提示词` 只审计勾选的漏洞类型；`按审计 Skill` 完全按照所选 Skill 规定执行，并可输出 Skill 自定义报告。两种模式都支持漏洞管理、运行记录与报告导出。
 - **弹窗式目录选择**：支持盘符 / 根目录、上一级、面包屑与路径输入，逐层预览后再确认，避免手输路径出错。
 - **模型与客户端同步**：任务可直接选择 DSH 已配置的模型服务商与模型；未选择时按「任务设置 → 插件默认 → DSH 默认模型」顺序回退。
 - **调度方式**：手动、定时一次、5 字段 Cron、固定间隔。
@@ -38,9 +39,24 @@ DeepSeek Harness（DSH）代码审计插件：用任务化的方式管理代码�
 | 网络与配置 | 服务端请求伪造 SSRF、硬编码凭据与敏感信息泄露、日志 / 异常与信息泄露 |
 | 其他 | 不安全的反序列化、加密与随机数缺陷、依赖与供应链风险 |
 
+### 审计 Skill
+
+- Skill 直接采用标准 `SKILL.md` 格式：YAML frontmatter（`name`、`description`、`tools`、`file_patterns` 等）+ Markdown 正文，参考文件放在 `references/` 目录，与 [CodeAuditSkill](https://github.com/zhiyuwang720-dev/CodeAuditSkill/) 等仓库的 Skill 结构一致。
+- 支持新建、修改、启用 / 禁用、删除审计 Skill；编辑器内直接编辑 `SKILL.md`，并可增删 `references/` 参考文件。
+- 保存或导入后会自动镜像到用户级 DSH Skill 目录 `~/.dsh/skills/<name>/`（`SKILL.md` + `references/`）：DSH 会把 `name` 注册为可自动调用的 Skill，并支持在任意会话输入 `/name` 直接加载，例如 `/web-vuln-audit`。停用、删除或改名时会同步清理旧目录。
+- 镜像只覆盖本插件创建的目录（通过 `.dsh-code-audit.json` 标记识别）；与已有同名第三方 Skill 冲突时不会覆盖。名称需为 kebab-case（如 `web-vuln-audit`），否则仅保留在插件内。
+- `/audit skills` 可列出插件内的审计 Skill 及其对应的会话调用命令。
+- 导入支持：单个 `SKILL.md`、整个 Skill 目录（含 `references/`）、ZIP 包，以及旧版 YAML / JSON 备份；导入按 `name` 合并。
+- 导出支持：单个 Skill 导出为 `SKILL.md + references/` 的 ZIP；也可一键导出全部 Skill 为多目录 ZIP；仍保留旧版 YAML 备份导出。
+- 审计时优先走 DSH 原生 Skill 调用：审计提示词以 `/skill-name` 开头，由 DSH 加载 `SKILL.md` 正文、Agent 按需读取 `references/` 下的文件；仅当该 Skill 未镜像成功（名称非法或与第三方 Skill 同名冲突）时，才回退为正文 + 全部参考文件内联。
+- 若 `references/` 中包含 `audit-report-template.md`，会自动识别为「报告格式指南」；也可在编辑器中手动覆盖。审计结束时 Agent 按该格式提交 Markdown 报告，可在任务中单独导出 Skill 报告。
+- 若 Skill 原文要求把报告写入被审计项目目录（如 `reports/`），插件会改为要求通过 `code_audit_submit_skill_report` 提交，保持被审计仓库只读。
+- 任务引用的 Skill 被删除后，任务会明确提示重新选择，不会静默回退。
+
 ### 专业审计报告
 
 - 支持 Markdown、HTML、JSON 三种格式，可在「审计任务」行点击「报告」导出，或通过 `/audit report` 与 Agent 工具导出。
+- **双报告**：Skill 模式任务既可导出统一格式的标准审计报告，也可在提交 Skill 报告后导出按 Skill 格式生成的 Skill 报告。
 - **Markdown**：报告编号、报告信息表、执行摘要、风险分布、重点漏洞、审计范围与方法、审计覆盖、VULN 编号漏洞详情、未发现问题类型、运行历史、运行总结与免责声明。
 - **HTML**：深色渐变封面、报告编号与元信息、统计磁贴、目录、严重级别分组卡片、深色 PoC 代码块、打印样式与响应式布局，适合直接交付或归档。
 - **JSON**：包含报告元信息、任务、运行记录、漏洞与覆盖明细，便于二次处理。
@@ -93,8 +109,10 @@ http://127.0.0.1:<DSH 端口>/dsh-code-audit/
 在「审计任务」中点击「新建任务」：
 
 1. 填写任务名称与任务说明（例如关注的模块、业务背景）。
-2. 点击「选择目录」，在弹窗中逐层预览并选择代码目录。
-3. 勾选本次要启用的漏洞提示词；未勾选的类型不会审计，也不会被要求上报。
+2. 先选择审计方式：
+   - **按提示词**：勾选本次要启用的漏洞提示词；未勾选的类型不会审计。
+   - **按审计 Skill**：选择已在「审计 Skill」页创建 / 导入的 Skill，任务将完全按该 Skill 的 `SKILL.md` 与参考文件执行。
+3. 点击「选择目录」，在弹窗中逐层预览并选择代码目录。
 4. 按需选择模型服务商与模型；留空则使用插件默认或 DSH 默认模型。
 5. 选择调度方式：
    - 手动：仅点击运行时执行；
@@ -102,6 +120,17 @@ http://127.0.0.1:<DSH 端口>/dsh-code-audit/
    - Cron：填写 5 字段表达式，例如 `0 2 * * *`；
    - 固定间隔：按分钟周期执行。
 6. 保存任务。
+
+### 2.1 导入现成的审计 Skill
+
+在「审计 Skill」页点击「导入 Skill」，可以：
+
+- 选择整个 Skill 目录（包含 `SKILL.md` 与 `references/`）；
+- 选择 `SKILL.md` 或 ZIP 包；
+- 选择旧版 YAML / JSON 备份；
+- 直接粘贴 `SKILL.md` 内容。
+
+导入按 frontmatter 的 `name` 合并：同名 Skill 更新内容，新名称则创建。
 
 ### 3. 运行任务并查看进度
 
@@ -135,9 +164,11 @@ http://127.0.0.1:<DSH 端口>/dsh-code-audit/
 
 ```text
 /audit list                          列出任务
+/audit skills                        列出审计 Skill 及可用的 /名称 调用
 /audit prompts                       列出审计提示词
 /audit run <任务ID>                  立即运行任务
 /audit report <任务ID> [格式]        导出报告（markdown|html|json）
+/web-vuln-audit                      直接加载已同步的审计 Skill（任意会话可用）
 ```
 
 ## Agent 工具
@@ -148,11 +179,13 @@ http://127.0.0.1:<DSH 端口>/dsh-code-audit/
 | `code_audit_create_task` | 新建审计任务（含调度） |
 | `code_audit_run_task` | 立即运行任务 |
 | `code_audit_list_prompts` | 列出审计提示词 |
-| `code_audit_report_progress` | 上报审计进度（开始 / 完成某个漏洞类型） |
+| `code_audit_list_skills` | 列出审计 Skill |
+| `code_audit_report_progress` | 上报审计进度（开始 / 完成某个漏洞类型或 Skill） |
 | `code_audit_submit_finding` | 上报漏洞，支持 `poc_request` 提交 PoC 请求包 |
 | `code_audit_submit_summary` | 提交运行总结 |
+| `code_audit_submit_skill_report` | 按 Skill 规定的报告格式提交 Markdown 报告 |
 | `code_audit_update_finding` | 更新漏洞处理状态 |
-| `code_audit_export_report` | 导出报告文件 |
+| `code_audit_export_report` | 导出报告文件（标准报告或 Skill 报告） |
 
 ## 调度说明
 
@@ -171,7 +204,7 @@ http://127.0.0.1:<DSH 端口>/dsh-code-audit/
 
 ```text
 ${DSH_HOME}/storages/code-audit/
-├── code-audit.db                 # SQLite：tasks / runs / findings / prompts / settings
+├── code-audit.db                 # SQLite：tasks / runs / findings / prompts / skills / settings
 ├── trajectories/<runId>.jsonl    # 每次运行的原生 session 事件流（NDJSON）
 └── reports/                      # 导出的报告归档
 ```
@@ -179,7 +212,8 @@ ${DSH_HOME}/storages/code-audit/
 - `DSH_HOME` 默认是 `~/.dsh`，也可通过插件配置 `dataDir` 覆盖。
 - SQLite 使用 WAL 模式，插件卸载时自动关闭。
 - 漏洞记录包含 PoC 字段；旧数据库在升级后会自动补充该列，无需手工迁移。
-- 提示词备份为 YAML（也接受 JSON），按名称合并导入。
+- 审计 Skill 以完整 `SKILL.md` + `references` 文件内容 + frontmatter 元数据的形式存储在 SQLite 中，导出时再组装为标准目录 / ZIP。
+- 提示词与 Skill 的旧版备份均为 YAML（也接受 JSON），按名称合并导入。
 - DSH 自身的会话持久化文件仍由 DSH 管理；插件的 JSONL 是面向审计运行的独立轨迹副本，可直接下载分析。
 
 ## 配置
@@ -199,7 +233,7 @@ ${DSH_HOME}/storages/code-audit/
     schedulerIntervalMs: 30000
 ```
 
-控制台「设置」页可修改最大并发数、单次超时与默认模型，修改持久化在 SQLite 的 `settings` 表。
+控制台「设置」页可修改最大并发数、单次超时、模型回复失败后的自动续跑间隔（0–1440 分钟）、自动续跑次数与默认模型，修改持久化在 SQLite 的 `settings` 表。
 
 ## 安全说明
 

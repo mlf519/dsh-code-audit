@@ -31,6 +31,19 @@ export class AuditStore {
         updated_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS skills (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        category TEXT NOT NULL DEFAULT '',
+        description TEXT NOT NULL DEFAULT '',
+        content TEXT NOT NULL DEFAULT '',
+        report_guide TEXT NOT NULL DEFAULT '',
+        builtin INTEGER NOT NULL DEFAULT 0,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS tasks (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -98,7 +111,14 @@ export class AuditStore {
       );
     `)
     this.ensureColumn('runs', 'progress_json', "TEXT NOT NULL DEFAULT '{}'")
+    this.ensureColumn('runs', 'skill_report', "TEXT NOT NULL DEFAULT ''")
     this.ensureColumn('findings', 'poc', "TEXT NOT NULL DEFAULT ''")
+    this.ensureColumn('findings', 'skill_id', "TEXT NOT NULL DEFAULT ''")
+    this.ensureColumn('tasks', 'audit_mode', "TEXT NOT NULL DEFAULT 'prompts'")
+    this.ensureColumn('tasks', 'skill_id', "TEXT NOT NULL DEFAULT ''")
+    this.ensureColumn('skills', 'skill_md', "TEXT NOT NULL DEFAULT ''")
+    this.ensureColumn('skills', 'references_json', "TEXT NOT NULL DEFAULT '[]'")
+    this.ensureColumn('skills', 'manifest_json', "TEXT NOT NULL DEFAULT '{}'")
   }
 
   /** Add a column to an existing table when an older database lacks it. */
@@ -214,6 +234,96 @@ export class AuditStore {
     return { prompt: this.createPrompt({ ...input, builtin: false }), created: true }
   }
 
+  // ----------------------------------------------------------------- skills
+
+  listSkills({ enabledOnly = false } = {}) {
+    const sql = enabledOnly
+      ? 'SELECT * FROM skills WHERE enabled = 1 ORDER BY builtin DESC, name'
+      : 'SELECT * FROM skills ORDER BY builtin DESC, name'
+    return this.db.prepare(sql).all().map(row => this.mapSkill(row))
+  }
+
+  getSkill(id) {
+    const row = this.db.prepare('SELECT * FROM skills WHERE id = ?').get(id)
+    return row ? this.mapSkill(row) : undefined
+  }
+
+  getSkillByName(name) {
+    const row = this.db.prepare('SELECT * FROM skills WHERE name = ?').get(name)
+    return row ? this.mapSkill(row) : undefined
+  }
+
+  createSkill(input) {
+    const stamp = nowIso()
+    const id = newId('s')
+    this.db.prepare(
+      `INSERT INTO skills (id, name, category, description, content, report_guide, skill_md, references_json,
+        manifest_json, builtin, enabled, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      id,
+      input.name,
+      input.category ?? '',
+      input.description ?? '',
+      input.content ?? '',
+      input.report_guide ?? '',
+      input.skill_md ?? '',
+      JSON.stringify(input.references ?? []),
+      JSON.stringify(input.manifest ?? {}),
+      input.builtin ? 1 : 0,
+      input.enabled === false ? 0 : 1,
+      stamp,
+      stamp,
+    )
+    return this.getSkill(id)
+  }
+
+  updateSkill(id, patch) {
+    const current = this.getSkill(id)
+    if (!current) return undefined
+    this.db.prepare(
+      `UPDATE skills SET name = ?, category = ?, description = ?, content = ?, report_guide = ?,
+        skill_md = ?, references_json = ?, manifest_json = ?, enabled = ?, updated_at = ? WHERE id = ?`,
+    ).run(
+      patch.name ?? current.name,
+      patch.category ?? current.category,
+      patch.description ?? current.description,
+      patch.content ?? current.content,
+      patch.report_guide ?? current.report_guide,
+      patch.skill_md ?? current.skill_md,
+      JSON.stringify(patch.references ?? current.references ?? []),
+      JSON.stringify(patch.manifest ?? current.manifest ?? {}),
+      patch.enabled === undefined ? (current.enabled ? 1 : 0) : patch.enabled ? 1 : 0,
+      nowIso(),
+      id,
+    )
+    return this.getSkill(id)
+  }
+
+  deleteSkill(id) {
+    const result = this.db.prepare('DELETE FROM skills WHERE id = ?').run(id)
+    return result.changes > 0
+  }
+
+  /** Insert or update a skill by name; used by file and backup imports. */
+  upsertSkillByName(input) {
+    const existing = this.getSkillByName(input.name)
+    if (existing) {
+      this.updateSkill(existing.id, {
+        category: input.category ?? existing.category,
+        description: input.description ?? existing.description,
+        content: input.content ?? existing.content,
+        report_guide: input.report_guide ?? existing.report_guide,
+        skill_md: input.skill_md ?? existing.skill_md,
+        references: input.references ?? existing.references,
+        manifest: input.manifest ?? existing.manifest,
+        enabled: input.enabled === undefined ? existing.enabled : input.enabled,
+      })
+      return { skill: this.getSkill(existing.id), created: false }
+    }
+    return { skill: this.createSkill({ ...input, builtin: false }), created: true }
+  }
+
   // ------------------------------------------------------------------ tasks
 
   listTasks() {
@@ -229,15 +339,17 @@ export class AuditStore {
     const stamp = nowIso()
     const id = newId('t')
     this.db.prepare(
-      `INSERT INTO tasks (id, name, repo_path, description, prompt_ids, status, schedule_type, schedule_at,
-        schedule_cron, interval_minutes, next_run_at, enabled, provider, model, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO tasks (id, name, repo_path, description, prompt_ids, audit_mode, skill_id, status, schedule_type,
+        schedule_at, schedule_cron, interval_minutes, next_run_at, enabled, provider, model, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       id,
       input.name,
       input.repo_path,
       input.description ?? '',
       JSON.stringify(input.prompt_ids ?? []),
+      input.audit_mode === 'skill' ? 'skill' : 'prompts',
+      input.skill_id ?? '',
       input.status ?? 'draft',
       input.schedule_type ?? 'manual',
       input.schedule_at ?? null,
@@ -258,15 +370,17 @@ export class AuditStore {
     if (!current) return undefined
     const next = { ...current, ...patch }
     this.db.prepare(
-      `UPDATE tasks SET name = ?, repo_path = ?, description = ?, prompt_ids = ?, status = ?, schedule_type = ?,
-        schedule_at = ?, schedule_cron = ?, interval_minutes = ?, next_run_at = ?, enabled = ?, provider = ?,
-        model = ?, updated_at = ?, last_run_at = ?
+      `UPDATE tasks SET name = ?, repo_path = ?, description = ?, prompt_ids = ?, audit_mode = ?, skill_id = ?,
+        status = ?, schedule_type = ?, schedule_at = ?, schedule_cron = ?, interval_minutes = ?, next_run_at = ?,
+        enabled = ?, provider = ?, model = ?, updated_at = ?, last_run_at = ?
        WHERE id = ?`,
     ).run(
       next.name,
       next.repo_path,
       next.description ?? '',
       JSON.stringify(next.prompt_ids ?? []),
+      next.audit_mode === 'skill' ? 'skill' : 'prompts',
+      next.skill_id ?? '',
       next.status ?? 'draft',
       next.schedule_type ?? 'manual',
       next.schedule_at ?? null,
@@ -339,7 +453,7 @@ export class AuditStore {
     const next = { ...current, ...patch }
     this.db.prepare(
       `UPDATE runs SET status = ?, finished_at = ?, session_id = ?, trajectory_path = ?, summary = ?,
-        error = ?, findings_count = ?, progress_json = ?
+        error = ?, findings_count = ?, progress_json = ?, skill_report = ?
        WHERE id = ?`,
     ).run(
       next.status,
@@ -350,6 +464,7 @@ export class AuditStore {
       next.error ?? null,
       next.findings_count ?? 0,
       JSON.stringify(next.progress ?? {}),
+      next.skill_report ?? '',
       id,
     )
     return this.getRun(id)
@@ -378,7 +493,8 @@ export class AuditStore {
     if (existing) {
       this.db.prepare(
         `UPDATE findings SET description = ?, evidence = ?, recommendation = ?, poc = ?, code_snippet = ?,
-          severity = ?, file_path = ?, line_start = ?, line_end = ?, updated_at = ?
+          severity = ?, category = ?, file_path = ?, line_start = ?, line_end = ?, prompt_id = ?, skill_id = ?,
+          updated_at = ?
          WHERE id = ?`,
       ).run(
         input.description ?? '',
@@ -387,9 +503,12 @@ export class AuditStore {
         input.poc ?? '',
         input.code_snippet ?? '',
         input.severity ?? 'medium',
+        input.category ?? '',
         input.file_path ?? '',
         input.line_start ?? null,
         input.line_end ?? null,
+        input.prompt_id ?? null,
+        input.skill_id ?? '',
         stamp,
         existing.id,
       )
@@ -397,15 +516,16 @@ export class AuditStore {
     }
     const id = newId('f')
     this.db.prepare(
-      `INSERT INTO findings (id, task_id, run_id, prompt_id, title, severity, category, file_path, line_start,
-        line_end, code_snippet, description, evidence, recommendation, poc, status, status_note, fingerprint,
-        created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', '', ?, ?, ?)`,
+      `INSERT INTO findings (id, task_id, run_id, prompt_id, skill_id, title, severity, category, file_path,
+        line_start, line_end, code_snippet, description, evidence, recommendation, poc, status, status_note,
+        fingerprint, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', '', ?, ?, ?)`,
     ).run(
       id,
       taskId,
       input.run_id ?? null,
       input.prompt_id ?? null,
+      input.skill_id ?? '',
       input.title,
       input.severity ?? 'medium',
       input.category ?? '',
@@ -511,6 +631,24 @@ export class AuditStore {
     }
   }
 
+  mapSkill(row) {
+    return {
+      id: row.id,
+      name: row.name,
+      category: row.category,
+      description: row.description,
+      content: row.content,
+      report_guide: row.report_guide ?? '',
+      skill_md: row.skill_md ?? '',
+      references: parseJson(row.references_json, []),
+      manifest: parseJson(row.manifest_json, {}),
+      builtin: Boolean(row.builtin),
+      enabled: Boolean(row.enabled),
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+    }
+  }
+
   mapTask(row) {
     return {
       id: row.id,
@@ -518,6 +656,8 @@ export class AuditStore {
       repo_path: row.repo_path,
       description: row.description,
       prompt_ids: parseJson(row.prompt_ids, []),
+      audit_mode: row.audit_mode === 'skill' ? 'skill' : 'prompts',
+      skill_id: row.skill_id ?? '',
       status: row.status,
       schedule_type: row.schedule_type,
       schedule_at: row.schedule_at,
@@ -547,6 +687,7 @@ export class AuditStore {
       error: row.error,
       findings_count: Number(row.findings_count ?? 0),
       progress: parseJson(row.progress_json, {}),
+      skill_report: row.skill_report ?? '',
     }
   }
 
@@ -556,6 +697,7 @@ export class AuditStore {
       task_id: row.task_id,
       run_id: row.run_id,
       prompt_id: row.prompt_id,
+      skill_id: row.skill_id ?? '',
       title: row.title,
       severity: row.severity,
       category: row.category,

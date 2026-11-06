@@ -1,7 +1,7 @@
 {
   "name": "dsh-code-audit",
-  "version": "0.1.6",
-  "description": "Code audit plugin for DeepSeek Harness: manage audit tasks, vulnerability prompts, findings and reports.",
+  "version": "0.4.0",
+  "description": "Code audit plugin for DeepSeek Harness: manage audit tasks, vulnerability prompts, SKILL.md audit skills, findings and reports.",
   "type": "module",
   "main": "./src/index.js",
   "exports": {
@@ -48,6 +48,7 @@
     "dsh-plugin",
     "deepseek-harness",
     "code-audit",
+    "audit-skill",
     "security"
   ],
   "license": "MIT"

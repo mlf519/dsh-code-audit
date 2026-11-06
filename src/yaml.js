@@ -59,6 +59,84 @@ export function parsePromptsDocument(text) {
     .filter(item => item.name !== '')
 }
 
+/** Serialise the skill backup document as human-editable YAML. */
+export function stringifySkillsDocument(skills) {
+  const lines = []
+  lines.push('version: 1')
+  lines.push(`exportedAt: ${JSON.stringify(new Date().toISOString())}`)
+  lines.push('skills:')
+  if (skills.length === 0) {
+    lines[lines.length - 1] = 'skills: []'
+    return `${lines.join('\n')}\n`
+  }
+  for (const skill of skills) {
+    lines.push(`  - name: ${quoteScalar(skill.name)}`)
+    lines.push(`    category: ${quoteScalar(skill.category ?? '')}`)
+    lines.push(`    description: ${quoteScalar(skill.description ?? '')}`)
+    lines.push(`    enabled: ${skill.enabled === false ? 'false' : 'true'}`)
+    lines.push(`    references: ${quoteScalar(JSON.stringify(skill.references ?? []))}`)
+    appendBlockScalar(lines, 'skillMd', String(skill.skill_md ?? ''), 4)
+    appendBlockScalar(lines, 'content', String(skill.content ?? ''), 4)
+    appendBlockScalar(lines, 'reportGuide', String(skill.report_guide ?? skill.reportGuide ?? ''), 4)
+  }
+  return `${lines.join('\n')}\n`
+}
+
+/** Parse a skill backup document into an array of skill records. */
+export function parseSkillsDocument(text) {
+  const source = String(text ?? '').replace(/^\uFEFF/, '')
+  if (source.trim() === '') throw new Error('YAML 内容为空')
+  let document
+  const trimmed = source.trimStart()
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    document = JSON.parse(source)
+  } else {
+    document = parseYamlDocument(source)
+  }
+  const list = Array.isArray(document) ? document : document?.skills
+  if (!Array.isArray(list)) throw new Error('备份文件缺少 skills 列表')
+  return list
+    .filter(item => item && typeof item === 'object')
+    .map(item => ({
+      name: String(item.name ?? '').trim(),
+      category: String(item.category ?? '').trim(),
+      description: String(item.description ?? '').trim(),
+      enabled: item.enabled === undefined ? true : item.enabled !== false,
+      content: String(item.content ?? ''),
+      report_guide: String(item.reportGuide ?? item.report_guide ?? ''),
+      skill_md: String(item.skillMd ?? item.skill_md ?? ''),
+      references: parseReferences(item.references),
+    }))
+    .filter(item => item.name !== '')
+}
+
+function parseReferences(value) {
+  if (Array.isArray(value)) return value
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value)
+      return Array.isArray(parsed) ? parsed : []
+    } catch {
+      return []
+    }
+  }
+  return []
+}
+
+function appendBlockScalar(lines, key, content, keyIndent) {
+  const pad = ' '.repeat(keyIndent)
+  if (!content) {
+    lines.push(`${pad}${key}: ""`)
+    return
+  }
+  const keepTrailingNewline = content.endsWith('\n')
+  lines.push(`${pad}${key}: ${keepTrailingNewline ? '|' : '|-'}`)
+  const bodyLines = content.split('\n')
+  if (keepTrailingNewline) bodyLines.pop()
+  const bodyPad = ' '.repeat(keyIndent + 2)
+  for (const line of bodyLines) lines.push(line === '' ? '' : `${bodyPad}${line}`)
+}
+
 /** Parse one YAML document into plain JavaScript values. */
 export function parseYamlDocument(source) {
   const lines = source.split(/\r?\n/)

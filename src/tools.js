@@ -31,12 +31,15 @@ export async function registerAuditTools(ctx, { store, runner, dataDir, log = ()
     parameters: {},
     output: { schema: { type: 'json' }, render: (_args, value) => textResult(value) },
     async execute() {
+      const skills = new Map(store.listSkills().map(skill => [skill.id, skill]))
       const tasks = store.listTasks().map(task => ({
         id: task.id,
         name: task.name,
         repo_path: task.repo_path,
         status: task.status,
         enabled: task.enabled,
+        audit_mode: task.audit_mode,
+        skill_name: task.skill_id ? skills.get(task.skill_id)?.name ?? '' : '',
         schedule_type: task.schedule_type,
         schedule_at: task.schedule_at,
         schedule_cron: task.schedule_cron,
@@ -50,15 +53,24 @@ export async function registerAuditTools(ctx, { store, runner, dataDir, log = ()
 
   register(defineTool({
     name: 'code_audit_create_task',
-    description: '新建一个代码审计任务。可指定审计目录、任务说明、要启用的漏洞审计提示词，以及定时执行计划。',
+    description: '新建一个代码审计任务。可选择按漏洞审计提示词或按审计 Skill 执行，并配置定时执行计划。',
     parameters: {
       name: { type: 'string', description: '任务名称', required: true },
       repo_path: { type: 'string', description: '要审计的本地代码目录绝对路径', required: true },
       description: { type: 'string', description: '任务说明，例如关注的模块或业务背景' },
+      audit_mode: {
+        type: 'string',
+        enum: ['prompts', 'skill'],
+        description: '审计模式：prompts 按漏洞提示词审计（默认），skill 按审计 Skill 规定审计',
+      },
+      skill_name: {
+        type: 'string',
+        description: 'audit_mode 为 skill 时要使用的审计 Skill 名称',
+      },
       prompt_names: {
         type: 'array',
         items: { type: 'string' },
-        description: '要启用的漏洞审计提示词名称列表；省略则审计全部启用的提示词',
+        description: 'audit_mode 为 prompts 时要启用的漏洞审计提示词名称列表；省略则审计全部启用的提示词',
       },
       schedule_type: {
         type: 'string',
@@ -71,18 +83,31 @@ export async function registerAuditTools(ctx, { store, runner, dataDir, log = ()
     },
     output: { schema: { type: 'json' }, render: (_args, value) => textResult(value) },
     async execute(args) {
-      const allPrompts = store.listPrompts()
-      const promptIds = args.prompt_names?.length
-        ? args.prompt_names.map(name => {
-            const prompt = allPrompts.find(item => item.name === name)
-            if (!prompt) throw new Error(`提示词不存在：${name}`)
-            return prompt.id
-          })
-        : allPrompts.filter(prompt => prompt.enabled).map(prompt => prompt.id)
+      const auditMode = args.audit_mode === 'skill' ? 'skill' : 'prompts'
+      let promptIds = []
+      let skillId = ''
+      if (auditMode === 'skill') {
+        if (!args.skill_name) throw new Error('Skill 模式需要指定 skill_name')
+        const skill = store.getSkillByName(args.skill_name)
+        if (!skill) throw new Error(`审计 Skill 不存在：${args.skill_name}`)
+        if (!skill.enabled) throw new Error(`审计 Skill 已禁用：${skill.name}`)
+        skillId = skill.id
+      } else {
+        const allPrompts = store.listPrompts()
+        promptIds = args.prompt_names?.length
+          ? args.prompt_names.map(name => {
+              const prompt = allPrompts.find(item => item.name === name)
+              if (!prompt) throw new Error(`提示词不存在：${name}`)
+              return prompt.id
+            })
+          : allPrompts.filter(prompt => prompt.enabled).map(prompt => prompt.id)
+      }
       const task = createTask(store, {
         name: args.name,
         repo_path: args.repo_path,
         description: args.description ?? '',
+        audit_mode: auditMode,
+        skill_id: skillId,
         prompt_ids: promptIds,
         schedule_type: args.schedule_type ?? 'manual',
         schedule_at: args.schedule_at,
@@ -120,6 +145,26 @@ export async function registerAuditTools(ctx, { store, runner, dataDir, log = ()
           default_severity: prompt.default_severity,
           enabled: prompt.enabled,
           builtin: prompt.builtin,
+        })),
+      }
+    },
+  }))
+
+  register(defineTool({
+    name: 'code_audit_list_skills',
+    description: '列出可用的代码审计 Skill（名称、分类、说明、是否启用、是否规定报告格式）。',
+    parameters: {},
+    output: { schema: { type: 'json' }, render: (_args, value) => textResult(value) },
+    async execute() {
+      return {
+        skills: store.listSkills().map(skill => ({
+          id: skill.id,
+          name: skill.name,
+          category: skill.category,
+          description: skill.description,
+          enabled: skill.enabled,
+          builtin: skill.builtin,
+          has_report_guide: Boolean(String(skill.report_guide ?? '').trim()),
         })),
       }
     },
@@ -181,12 +226,31 @@ export async function registerAuditTools(ctx, { store, runner, dataDir, log = ()
   }))
 
   register(defineTool({
+    name: 'code_audit_submit_skill_report',
+    description: '在 Skill 模式的代码审计结束时，按 Skill 规定的报告格式提交完整的 Markdown 报告。',
+    parameters: {
+      content: {
+        type: 'string',
+        description: '按 Skill 报告格式生成的完整 Markdown 报告内容',
+        required: true,
+      },
+    },
+    output: { schema: { type: 'json' }, render: (_args, value) => textResult(value) },
+    async execute(args, exec) {
+      const context = runner.contextForAgent(exec.agent)
+      if (!context) throw new Error('当前不在代码审计运行中，无法提交 Skill 报告')
+      runner.submitSkillReport(context, args.content)
+      return { ok: true }
+    },
+  }))
+
+  register(defineTool({
     name: 'code_audit_report_progress',
-    description: '在代码审计过程中上报当前进度：开始或完成某个漏洞类型的审计。控制台用这些上报显示扫描进度。',
+    description: '在代码审计过程中上报当前进度：开始或完成某个漏洞类型（或 Skill 审计）。控制台用这些上报显示扫描进度。',
     parameters: {
       prompt_name: {
         type: 'string',
-        description: '正在审计的漏洞提示词名称，与任务提示词标题中的名称一致',
+        description: '正在审计的漏洞提示词名称；Skill 模式下填写 Skill 名称',
         required: true,
       },
       status: {
@@ -231,7 +295,7 @@ export async function registerAuditTools(ctx, { store, runner, dataDir, log = ()
 
   register(defineTool({
     name: 'code_audit_export_report',
-    description: '导出指定审计任务的报告（markdown、html 或 json），返回报告文件路径。',
+    description: '导出指定审计任务的报告（markdown、html 或 json），返回报告文件路径。Skill 模式可选标准报告或 Skill 自定义报告。',
     parameters: {
       task_id: { type: 'string', description: '任务 ID', required: true },
       format: {
@@ -239,10 +303,17 @@ export async function registerAuditTools(ctx, { store, runner, dataDir, log = ()
         enum: ['markdown', 'html', 'json'],
         description: '报告格式，默认 markdown',
       },
+      report_type: {
+        type: 'string',
+        enum: ['standard', 'skill'],
+        description: 'standard 标准审计报告（默认），skill 按 Skill 规定生成的报告',
+      },
     },
     output: { schema: { type: 'json' }, render: (_args, value) => textResult(value) },
     async execute(args) {
-      const report = buildTaskReport(store, args.task_id, args.format ?? 'markdown')
+      const report = buildTaskReport(store, args.task_id, args.format ?? 'markdown', {
+        type: args.report_type === 'skill' ? 'skill' : 'standard',
+      })
       const reportsDir = join(dataDir, 'reports')
       mkdirSync(reportsDir, { recursive: true })
       const filePath = join(reportsDir, report.filename)

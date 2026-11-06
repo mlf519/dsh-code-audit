@@ -332,6 +332,7 @@ function renderCounts() {
   document.getElementById('count-tasks').textContent = state.data.tasks.length
   document.getElementById('count-findings').textContent = state.data.findings.length
   document.getElementById('count-prompts').textContent = state.data.prompts.length
+  document.getElementById('count-skills').textContent = state.data.skills.length
   document.getElementById('count-runs').textContent = state.data.runs.length
 }
 
@@ -341,6 +342,7 @@ function renderPanel() {
     tasks: renderTasks,
     findings: renderFindings,
     prompts: renderPrompts,
+    skills: renderSkills,
     runs: renderRuns,
     settings: renderSettings,
   }[state.tab]
@@ -355,12 +357,17 @@ function renderTasks() {
     const promptNames = task.prompt_names.length
       ? task.prompt_names.map(name => `<span class="badge info">${esc(name)}</span>`).join(' ')
       : '<span class="path">未选择提示词</span>'
+    const scope = task.audit_mode === 'skill'
+      ? (task.skill_name
+          ? `<span class="badge skill">Skill</span> <span class="badge info">${esc(task.skill_name)}</span>`
+          : '<span class="badge danger">Skill 已删除</span>')
+      : promptNames
     const schedule = task.schedule_type === 'manual'
       ? `<span class="badge manual">手动</span>`
       : `<span class="badge ${task.schedule_type}">${LABELS.schedule[task.schedule_type] ?? task.schedule_type}</span>${task.next_run_at ? `<small class="path">下次：${esc(fmtDate(task.next_run_at))}</small>` : ''}`
     return `<tr>
       <td class="title-cell">${taskLabel(task)}<small>${esc(task.repo_path)}</small></td>
-      <td>${promptNames}</td>
+      <td>${scope}</td>
       <td class="nowrap">${schedule}</td>
       <td>${badge(task.status, LABELS.taskStatus[task.status] ?? task.status)}${task.enabled ? '' : ' <span class="path">已暂停</span>'}</td>
       <td>${progressHtml(task.latest_run)}</td>
@@ -380,15 +387,15 @@ function renderTasks() {
 
   return `
     <div class="panel-head">
-      <div><h2>审计任务</h2><div class="sub">任务会按选中的漏洞提示词创建独立审计会话，未选择的漏洞类型不会被审计。</div></div>
+      <div><h2>审计任务</h2><div class="sub">支持按漏洞提示词或按审计 Skill 创建独立审计会话；未选择的范围不会被审计。</div></div>
       <div class="panel-actions">
         <button class="btn" data-action="export-task-report">导出报告</button>
         <button class="btn primary" data-action="new-task">新建任务</button>
       </div>
     </div>
     ${tasks.length === 0
-      ? `<div class="empty"><strong>还没有审计任务</strong>新建任务，选择代码目录与漏洞提示词后即可开始审计。<br><br><button class="btn primary" data-action="new-task">新建任务</button></div>`
-      : `<div class="table-wrap"><table><thead><tr><th>任务</th><th>审计提示词</th><th>调度</th><th>状态</th><th>进度</th><th>漏洞</th><th>最近运行</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table></div>`}`
+      ? `<div class="empty"><strong>还没有审计任务</strong>新建任务，选择代码目录与审计范围后即可开始审计。<br><br><button class="btn primary" data-action="new-task">新建任务</button></div>`
+      : `<div class="table-wrap"><table><thead><tr><th>任务</th><th>审计范围</th><th>调度</th><th>状态</th><th>进度</th><th>漏洞</th><th>最近运行</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table></div>`}`
 }
 
 function renderFindings() {
@@ -407,7 +414,7 @@ function renderFindings() {
 
   const rows = findings.map(finding => `<tr>
     <td>${badge(finding.severity, LABELS.severity[finding.severity] ?? finding.severity)}</td>
-    <td class="title-cell">${esc(finding.title)}<small>${esc(finding.task_name)} · ${esc(finding.category || '未分类')}${finding.prompt_name ? ` · ${esc(finding.prompt_name)}` : ''}</small></td>
+    <td class="title-cell">${esc(finding.title)}<small>${esc(finding.task_name)} · ${esc(finding.category || '未分类')}${finding.skill_name ? ` · Skill：${esc(finding.skill_name)}` : finding.prompt_name ? ` · ${esc(finding.prompt_name)}` : ''}</small></td>
     <td class="mono">${esc(finding.file_path || '—')}${finding.line_start ? `:${finding.line_start}${finding.line_end && finding.line_end !== finding.line_start ? `-${finding.line_end}` : ''}` : ''}</td>
     <td>${badge(finding.status, LABELS.findingStatus[finding.status] ?? finding.status)}</td>
     <td class="nowrap">${esc(fmtDate(finding.updated_at))}</td>
@@ -469,6 +476,39 @@ function renderPrompts() {
     <div class="panel-body"><div class="prompt-grid">${cards || '<div class="empty"><strong>暂无提示词</strong>新建或导入提示词后即可创建审计任务。</div>'}</div></div>`
 }
 
+function renderSkills() {
+  const cards = state.data.skills.map(skill => `<div class="prompt-card">
+    <header>
+      <h3>${esc(skill.name)}</h3>
+      <div>${badge('info', skill.enabled ? '启用' : '禁用', skill.enabled ? 'verified' : 'ignored')}</div>
+    </header>
+    <div class="meta">
+      ${skill.builtin ? '<span>内置</span>' : '<span>自定义</span>'}
+      <span>分类：${esc(skill.category || '未分类')}</span>
+      <span>${(skill.reference_paths ?? []).length} 个参考文件</span>
+      <span>${skill.has_report_guide ? '含报告格式' : '无报告格式'}</span>
+    </div>
+    <div class="preview">${esc(String(skill.description || skill.preview || '').slice(0, 260))}</div>
+    <footer>
+      <button class="btn small" data-action="edit-skill" data-id="${skill.id}">编辑</button>
+      <button class="btn small" data-action="export-skill" data-id="${skill.id}">导出</button>
+      <button class="btn small" data-action="toggle-skill" data-id="${skill.id}" data-enabled="${skill.enabled ? '1' : '0'}">${skill.enabled ? '禁用' : '启用'}</button>
+      <button class="btn small danger" data-action="delete-skill" data-id="${skill.id}">删除</button>
+    </footer>
+  </div>`).join('')
+
+  return `
+    <div class="panel-head">
+      <div><h2>代码审计 Skill</h2><div class="sub">Skill 使用标准 SKILL.md（YAML frontmatter + Markdown 正文）与 references/ 参考文件；保存或导入后会自动同步到 <code>~/.dsh/skills</code>，可直接在会话中用 <code>/名称</code> 调用。新建任务时也可选择按 Skill 执行，并同时导出标准报告与 Skill 报告。</div></div>
+      <div class="panel-actions">
+        <button class="btn primary" data-action="new-skill">新建 Skill</button>
+        <button class="btn" data-action="import-skills">导入 Skill</button>
+        <button class="btn" data-action="export-skills">导出全部 ZIP</button>
+      </div>
+    </div>
+    <div class="panel-body"><div class="prompt-grid">${cards || '<div class="empty"><strong>暂无审计 Skill</strong>新建或导入 SKILL.md 目录 / ZIP 后，即可在任务中选择按 Skill 审计。</div>'}</div></div>`
+}
+
 function renderRuns() {
   const rows = state.data.runs.map(run => `<tr>
     <td class="mono">${esc(run.id)}<small class="path">${esc(run.task_name)}</small></td>
@@ -499,7 +539,7 @@ function renderRuns() {
 function renderSettings() {
   const settings = state.data.settings
   return `
-    <div class="panel-head"><div><h2>设置</h2><div class="sub">运行并发、超时与默认模型。修改会立即生效。</div></div></div>
+    <div class="panel-head"><div><h2>设置</h2><div class="sub">运行并发、超时、自动续跑与默认模型。修改会立即生效。</div></div></div>
     <div class="panel-body">
       <div class="settings-card">
         <h3>运行设置</h3>
@@ -507,6 +547,8 @@ function renderSettings() {
         <form id="settings-form" class="form-grid">
           <div class="field"><label>最大并发审计数</label><input type="number" min="1" step="1" name="maxConcurrentRuns" value="${esc(settings.maxConcurrentRuns ?? 1)}"></div>
           <div class="field"><label>单次审计超时（分钟）</label><input type="number" min="0" step="1" name="runTimeoutMinutes" value="${esc(settings.runTimeoutMinutes ?? 60)}"></div>
+          <div class="field"><label>模型回复失败后自动续跑间隔（分钟）</label><input type="number" min="0" max="1440" step="1" name="llmRetryDelayMinutes" value="${esc(settings.llmRetryDelayMinutes ?? 5)}"><div class="hint">回复超时/失败后等待多久自动发送「继续」，0 表示立即，最大 1440（24 小时）。</div></div>
+          <div class="field"><label>自动续跑次数上限</label><input type="number" min="0" max="100" step="1" name="llmRetryCount" value="${esc(settings.llmRetryCount ?? 3)}"><div class="hint">达到次数仍未成功才判定任务失败；0 表示不自动续跑。</div></div>
           <div class="field"><label>默认模型服务商（可选）</label><input name="defaultProvider" placeholder="例如 deepseek" value="${esc(settings.defaultProvider ?? '')}"><div class="hint">留空使用 DSH 默认模型。</div></div>
           <div class="field"><label>默认模型（可选）</label><input name="defaultModel" placeholder="例如 deepseek-chat" value="${esc(settings.defaultModel ?? '')}"></div>
           <div class="full"><button class="btn primary" type="submit">保存设置</button></div>
@@ -560,6 +602,8 @@ function bindPanelExtras() {
           body: {
             maxConcurrentRuns: Number(data.get('maxConcurrentRuns')),
             runTimeoutMinutes: Number(data.get('runTimeoutMinutes')),
+            llmRetryDelayMinutes: Number(data.get('llmRetryDelayMinutes')),
+            llmRetryCount: Number(data.get('llmRetryCount')),
             defaultProvider: String(data.get('defaultProvider') ?? ''),
             defaultModel: String(data.get('defaultModel') ?? ''),
           },
@@ -621,6 +665,17 @@ async function openTaskModal(task) {
   const prompts = state.data.prompts
   const selected = new Set(task?.prompt_ids ?? [])
   const scheduleType = task?.schedule_type ?? 'manual'
+  const auditMode = task?.audit_mode === 'skill' ? 'skill' : 'prompts'
+  const skills = state.data.skills
+  const currentSkillId = task?.skill_id ?? ''
+  const skillOptions = [
+    currentSkillId && !skills.some(skill => skill.id === currentSkillId)
+      ? `<option value="${esc(currentSkillId)}" selected>（原 Skill 已删除，请重新选择）</option>`
+      : '',
+    ...skills
+      .filter(skill => skill.enabled || skill.id === currentSkillId)
+      .map(skill => `<option value="${skill.id}" ${skill.id === currentSkillId ? 'selected' : ''}>${esc(skill.name)}${skill.enabled ? '' : '（已禁用）'}</option>`),
+  ].join('')
   const promptList = prompts.length === 0
     ? '<div class="path">暂无提示词，请先在「审计提示词」中创建。</div>'
     : prompts.map(prompt => `<label class="prompt-item ${selected.has(prompt.id) ? 'selected' : ''}" data-prompt-id="${prompt.id}">
@@ -643,6 +698,19 @@ async function openTaskModal(task) {
       </div>
       <div class="field full"><label>任务说明</label><textarea name="description" rows="3" placeholder="关注的业务模块、已知风险点、审计边界…">${esc(task?.description ?? '')}</textarea></div>
       <div class="field full">
+        <label>审计模式</label>
+        <div class="mode-switch">
+          <label class="mode-option ${auditMode === 'prompts' ? 'active' : ''}" data-mode="prompts">
+            <input type="radio" name="audit_mode" value="prompts" ${auditMode === 'prompts' ? 'checked' : ''}>
+            <span><b>按漏洞提示词</b><small>只审计勾选的漏洞类型，沿用现有提示词体系。</small></span>
+          </label>
+          <label class="mode-option ${auditMode === 'skill' ? 'active' : ''}" data-mode="skill">
+            <input type="radio" name="audit_mode" value="skill" ${auditMode === 'skill' ? 'checked' : ''}>
+            <span><b>按审计 Skill</b><small>完全按照所选 Skill 规定执行，可输出 Skill 自定义报告。</small></span>
+          </label>
+        </div>
+      </div>
+      <div class="field full" data-mode-panel="prompts" ${auditMode === 'skill' ? 'hidden' : ''}>
         <div class="field-head">
           <label>漏洞审计提示词（只审计勾选的类型）</label>
           <div class="btn-group">
@@ -651,6 +719,13 @@ async function openTaskModal(task) {
           </div>
         </div>
         <div class="prompt-list">${promptList}</div>
+      </div>
+      <div class="field full" data-mode-panel="skill" ${auditMode === 'prompts' ? 'hidden' : ''}>
+        <label>审计 Skill *</label>
+        <select name="skill_id">
+          ${skillOptions || '<option value="">暂无可用 Skill，请先在「审计 Skill」中创建</option>'}
+        </select>
+        <div class="hint">Agent 会严格按该 Skill 的规定执行审计；若 Skill 规定了报告格式，还会生成一份 Skill 报告。</div>
       </div>
       <div class="field"><label>调度方式</label><select name="schedule_type">
         ${Object.entries(LABELS.schedule).map(([value, label]) => `<option value="${value}" ${scheduleType === value ? 'selected' : ''}>${label}</option>`).join('')}
@@ -672,6 +747,26 @@ async function openTaskModal(task) {
       }
     }
     select.addEventListener('change', toggle)
+
+    const modeRadios = [...form.querySelectorAll('[name="audit_mode"]')]
+    const syncMode = () => {
+      const mode = modeRadios.find(radio => radio.checked)?.value ?? 'prompts'
+      modal.querySelectorAll('[data-mode-panel]').forEach(node => {
+        node.hidden = node.dataset.modePanel !== mode
+      })
+      modal.querySelectorAll('.mode-option').forEach(node => {
+        node.classList.toggle('active', node.dataset.mode === mode)
+      })
+      // Skill mode decides the whole audit scope, so vulnerability prompts are
+      // not applicable and must not be selectable.
+      const promptPanel = modal.querySelector('[data-mode-panel="prompts"]')
+      promptPanel?.querySelectorAll('input').forEach(input => {
+        input.disabled = mode === 'skill'
+      })
+    }
+    modeRadios.forEach(radio => radio.addEventListener('change', syncMode))
+    syncMode()
+
     modal.querySelectorAll('.prompt-item').forEach(item => {
       item.addEventListener('click', event => {
         if (event.target.tagName !== 'INPUT') event.preventDefault()
@@ -710,11 +805,18 @@ async function openTaskModal(task) {
       event.preventDefault()
       const data = new FormData(form)
       const scheduleType = data.get('schedule_type')
-      const promptIds = [...form.querySelectorAll('.prompt-item input:checked')].map(input => input.value)
+      const mode = String(data.get('audit_mode') ?? 'prompts') === 'skill' ? 'skill' : 'prompts'
+      const skillId = String(data.get('skill_id') ?? '').trim()
+      if (mode === 'skill' && !skillId) return toast('请选择审计 Skill', true)
+      const promptIds = mode === 'skill'
+        ? []
+        : [...form.querySelectorAll('.prompt-item input:checked')].map(input => input.value)
       const payload = {
         name: String(data.get('name') ?? '').trim(),
         repo_path: String(data.get('repo_path') ?? '').trim(),
         description: String(data.get('description') ?? ''),
+        audit_mode: mode,
+        skill_id: mode === 'skill' ? skillId : '',
         prompt_ids: promptIds,
         schedule_type: scheduleType,
         enabled: data.get('enabled') === 'on',
@@ -742,18 +844,35 @@ async function openTaskModal(task) {
 }
 
 function openReportModal(task) {
-  const body = `<p class="prose">选择导出格式。任务审计到一半也可导出：报告包含当前已发现的漏洞，尚未审计的提示词以空章节保留。</p>`
-  const foot = `
-    <button class="btn" data-format="markdown" type="button">Markdown</button>
-    <button class="btn" data-format="html" type="button">HTML</button>
-    <button class="btn" data-format="json" type="button">JSON</button>
-    <button class="btn ghost" data-cancel="1" type="button">关闭</button>`
+  const skillMode = task.audit_mode === 'skill'
+  const hasSkillReport = Boolean(task.has_skill_report)
+  const formatButtons = type => ['markdown', 'html', 'json']
+    .map(format => `<button class="btn" data-format="${format}" data-type="${type}" type="button">${format === 'markdown' ? 'Markdown' : format.toUpperCase()}</button>`)
+    .join('')
+  const skillBlock = skillMode
+    ? `<div class="report-group">
+        <div class="group-head">Skill 报告</div>
+        ${hasSkillReport
+          ? `<div class="btn-group">${formatButtons('skill')}</div><div class="hint">按 Skill 规定的报告格式生成，来自最近一次已提交的 Skill 报告。</div>`
+          : '<div class="hint">最近一次运行还没有提交 Skill 报告；完成 Skill 模式审计后可导出。</div>'}
+      </div>`
+    : ''
+  const body = `
+    <p class="prose">任务审计到一半也可导出标准报告：报告包含当前已发现的漏洞，尚未审计的范围以空章节保留。</p>
+    <div class="report-group">
+      <div class="group-head">标准审计报告</div>
+      <div class="btn-group">${formatButtons('standard')}</div>
+      <div class="hint">统一格式，包含报告信息、执行摘要、覆盖范围、漏洞详情、PoC 请求包与运行历史。</div>
+    </div>
+    ${skillBlock}`
+  const foot = `<button class="btn ghost" data-cancel="1" type="button">关闭</button>`
   openModal(`导出报告 · ${task.name}`, body, foot, modal => {
     modal.querySelector('[data-cancel]')?.addEventListener('click', closeModal)
     modal.querySelectorAll('[data-format]').forEach(button => {
       button.addEventListener('click', () => {
-        download(`${API}/tasks/${task.id}/report?format=${button.dataset.format}`)
-        toast(`已开始导出 ${button.dataset.format}`)
+        const type = button.dataset.type
+        download(`${API}/tasks/${task.id}/report?format=${button.dataset.format}&type=${type}`)
+        toast(`已开始导出${type === 'skill' ? ' Skill ' : ' '}报告（${button.dataset.format}）`)
       })
     })
   })
@@ -768,7 +887,7 @@ function openFindingModal(finding) {
       <dt>严重级别</dt><dd>${badge(finding.severity, LABELS.severity[finding.severity] ?? finding.severity)}</dd>
       <dt>当前状态</dt><dd>${badge(finding.status, LABELS.findingStatus[finding.status] ?? finding.status)}</dd>
       <dt>所属任务</dt><dd>${esc(finding.task_name)}</dd>
-      <dt>分类</dt><dd>${esc(finding.category || '未分类')}${finding.prompt_name ? ` · ${esc(finding.prompt_name)}` : ''}</dd>
+      <dt>分类</dt><dd>${esc(finding.category || '未分类')}${finding.skill_name ? ` · Skill：${esc(finding.skill_name)}` : finding.prompt_name ? ` · ${esc(finding.prompt_name)}` : ''}</dd>
       <dt>位置</dt><dd class="mono">${esc(location)}</dd>
       <dt>发现时间</dt><dd>${esc(fmtDate(finding.created_at))}</dd>
       <dt>更新时间</dt><dd>${esc(fmtDate(finding.updated_at))}</dd>
@@ -864,6 +983,187 @@ function openPromptModal(prompt) {
   })
 }
 
+async function openSkillModal(skillId) {
+  let skill = null
+  if (skillId) {
+    try {
+      skill = (await api(`/skills/${skillId}`)).skill
+    } catch (error) {
+      toast(error.message, true)
+      return
+    }
+  }
+  const references = Array.isArray(skill?.references) ? skill.references : []
+  const body = `
+    <form id="skill-form" class="form-grid">
+      <div class="field"><label>分类</label><input name="category" value="${esc(skill?.category ?? '')}" placeholder="例如：Web / Java / 通用"></div>
+      <div class="field full"><label>SKILL.md *</label><textarea name="skill_md" rows="18" spellcheck="false" placeholder="---&#10;name: web-vuln-audit&#10;description: Web 应用漏洞审计&#10;---&#10;&#10;# 审计流程&#10;...">${esc(skillMarkdownForEditor(skill))}</textarea><div class="hint">标准格式：YAML frontmatter（name 必填，可加 description、tools、file_patterns 等）+ Markdown 正文。审计时正文与参考文件会一起注入会话。</div></div>
+      <div class="field full">
+        <label>参考文件（references/）</label>
+        <div id="skill-refs" class="ref-list">${references.map(reference => refRow(reference.path, reference.content)).join('')}</div>
+        <div class="ref-actions"><button type="button" class="btn small" id="skill-ref-add">添加参考文件</button></div>
+        <div class="hint">会随 SKILL.md 一起保存并导出为 ZIP；审计时自动内联。若包含 <code>audit-report-template.md</code>，将自动作为 Skill 报告格式。</div>
+      </div>
+      <div class="field full">
+        <label class="checkbox-line"><input type="checkbox" name="auto_report" ${skill?.report_guide ? '' : 'checked'}> 自动从参考文件识别报告格式</label>
+        <textarea name="report_guide" rows="6" placeholder="取消勾选后可手动填写报告格式指南；留空则不生成 Skill 报告。">${esc(skill?.report_guide ?? '')}</textarea>
+      </div>
+      <div class="field full"><label class="checkbox-line"><input type="checkbox" name="enabled" ${skill?.enabled === false ? '' : 'checked'}> 启用</label></div>
+    </form>`
+  const foot = `
+    ${skill ? '<button class="btn danger" data-delete="1" type="button">删除</button>' : ''}
+    <button class="btn ghost" data-cancel="1" type="button">取消</button>
+    <button class="btn primary" type="submit" form="skill-form">${skill ? '保存' : '创建'}</button>`
+  openModal(skill ? '编辑审计 Skill' : '新建审计 Skill', body, foot, modal => {
+    const refs = modal.querySelector('#skill-refs')
+    const autoReport = modal.querySelector('[name="auto_report"]')
+    const reportGuide = modal.querySelector('[name="report_guide"]')
+    const updateReportState = () => {
+      reportGuide.disabled = Boolean(autoReport?.checked)
+    }
+    updateReportState()
+    autoReport?.addEventListener('change', updateReportState)
+    modal.querySelector('#skill-ref-add')?.addEventListener('click', () => {
+      refs.insertAdjacentHTML('beforeend', refRow('', ''))
+    })
+    refs.addEventListener('click', event => {
+      const remove = event.target.closest('.ref-remove')
+      if (!remove) return
+      remove.closest('.ref-item')?.remove()
+    })
+    modal.querySelector('[data-cancel]')?.addEventListener('click', closeModal)
+    modal.querySelector('[data-delete]')?.addEventListener('click', async () => {
+      if (!confirm(`确定删除审计 Skill「${skill.name}」？已被任务引用的 Skill 删除后，相关任务需重新选择。`)) return
+      try {
+        await api(`/skills/${skill.id}`, { method: 'DELETE' })
+        closeModal()
+        toast('Skill 已删除')
+        await load({ silent: true })
+      } catch (error) {
+        toast(error.message, true)
+      }
+    })
+    modal.querySelector('#skill-form').addEventListener('submit', async event => {
+      event.preventDefault()
+      const data = new FormData(event.target)
+      const references = [...modal.querySelectorAll('.ref-item')]
+        .map(item => ({
+          path: String(item.querySelector('.ref-path')?.value ?? '').trim(),
+          content: String(item.querySelector('.ref-body')?.value ?? ''),
+        }))
+        .filter(reference => reference.path && reference.content.trim())
+      const skillMd = String(data.get('skill_md') ?? '')
+      if (!skillMd.trim()) return toast('SKILL.md 不能为空', true)
+      const payload = {
+        category: String(data.get('category') ?? '').trim(),
+        skill_md: skillMd,
+        references,
+        enabled: data.get('enabled') === 'on',
+      }
+      if (data.get('auto_report') !== 'on') payload.report_guide = String(data.get('report_guide') ?? '')
+      try {
+        const saved = skill
+          ? await api(`/skills/${skill.id}`, { method: 'PUT', body: payload })
+          : await api('/skills', { method: 'POST', body: payload })
+        closeModal()
+        if (saved?.dsh?.synced) toast(`已保存，并同步为会话命令 /${saved.dsh.name}`)
+        else toast(skill ? 'Skill 已保存' : 'Skill 已创建')
+        await load({ silent: true })
+      } catch (error) {
+        toast(error.message, true)
+      }
+    })
+  })
+}
+
+function skillMarkdownForEditor(skill) {
+  if (!skill) {
+    return ['---', 'name: ', 'description: ', '---', '', '# 审计流程', '', '1. '].join('\n')
+  }
+  if (String(skill.skill_md ?? '').trim()) return skill.skill_md
+  const quote = value => JSON.stringify(String(value ?? ''))
+  const lines = ['---', `name: ${quote(skill.name)}`]
+  if (skill.description) lines.push(`description: ${quote(skill.description)}`)
+  if (skill.category) lines.push(`category: ${quote(skill.category)}`)
+  lines.push('---', '', String(skill.content ?? ''))
+  return lines.join('\n')
+}
+
+function refRow(path, content) {
+  return `<div class="ref-item">
+    <div class="ref-head">
+      <input class="ref-path" value="${esc(path ?? '')}" placeholder="references/xxx.md" spellcheck="false">
+      <button type="button" class="btn small danger ref-remove">移除</button>
+    </div>
+    <textarea class="ref-body" rows="5" placeholder="参考文件内容">${esc(content ?? '')}</textarea>
+  </div>`
+}
+
+function openSkillImportModal() {
+  const body = `<div class="transfer-grid">
+    <div class="field"><label>选择 SKILL.md / ZIP / 旧版 YAML 备份</label><input type="file" id="skill-import-file" accept=".md,.markdown,.zip,.yml,.yaml,.json,.txt" multiple></div>
+    <div class="field"><label>或选择整个 Skill 目录</label><input type="file" id="skill-import-dir" webkitdirectory multiple></div>
+    <div class="field"><label>或直接粘贴 SKILL.md 内容</label><textarea id="skill-import-text" placeholder="---&#10;name: web-vuln-audit&#10;description: ...&#10;---&#10;&#10;# 审计流程"></textarea></div>
+    <div class="hint">支持标准 SKILL.md + references/ 目录、ZIP 包，也兼容旧版 YAML/JSON 备份。导入按名称合并：同名 Skill 更新内容，新名称则创建。</div>
+  </div>`
+  const foot = `<button class="btn ghost" data-cancel="1" type="button">取消</button><button class="btn primary" id="skill-import-submit" type="button">导入</button>`
+  openModal('导入审计 Skill', body, foot, modal => {
+    modal.querySelector('[data-cancel]')?.addEventListener('click', closeModal)
+    modal.querySelector('#skill-import-file').addEventListener('change', async event => {
+      const files = [...(event.target.files ?? [])]
+      const textFile = files.find(file => /\.(md|markdown|txt)$/i.test(file.name))
+      if (files.length === 1 && textFile) modal.querySelector('#skill-import-text').value = await textFile.text()
+    })
+    modal.querySelector('#skill-import-dir').addEventListener('change', () => {
+      modal.querySelector('#skill-import-text').value = ''
+    })
+    modal.querySelector('#skill-import-submit').addEventListener('click', async () => {
+      const picked = [...(modal.querySelector('#skill-import-file').files ?? [])]
+      const directory = [...(modal.querySelector('#skill-import-dir').files ?? [])]
+      const text = String(modal.querySelector('#skill-import-text').value ?? '').trim()
+      try {
+        let result
+        const zip = picked.find(file => /\.zip$/i.test(file.name))
+        const backup = picked.find(file => /\.(yml|yaml|json)$/i.test(file.name))
+        if (zip) {
+          result = await api('/skills/import-zip', { method: 'POST', body: { zip: await fileToBase64(zip) } })
+        } else if (backup) {
+          result = await api('/skills/import', { method: 'POST', body: { yaml: await backup.text() } })
+        } else {
+          const files = [...directory, ...picked.filter(file => !/\.zip$/i.test(file.name))]
+          if (files.length === 0 && text) files.push({ name: 'SKILL.md', text: async () => text })
+          const payload = []
+          for (const file of files) {
+            if (!SKILL_TEXT_FILE.test(file.name)) continue
+            payload.push({
+              path: file.webkitRelativePath || file.name,
+              content: typeof file.text === 'function' ? await file.text() : '',
+            })
+          }
+          if (payload.length === 0) throw new Error('请选择包含 SKILL.md 的文件或目录')
+          result = await api('/skills/import-files', { method: 'POST', body: { files: payload } })
+        }
+        closeModal()
+        const synced = Number(result.dsh_synced ?? 0)
+        toast(`导入完成：新增 ${result.created}，更新 ${result.updated}${synced ? `，已同步 ${synced} 个到 DSH` : ''}`)
+        await load({ silent: true })
+      } catch (error) {
+        toast(error.message, true)
+      }
+    })
+  })
+}
+
+const SKILL_TEXT_FILE = /\.(md|markdown|txt|json|yaml|yml)$/i
+
+async function fileToBase64(file) {
+  const buffer = await file.arrayBuffer()
+  const bytes = new Uint8Array(buffer)
+  let binary = ''
+  for (let index = 0; index < bytes.length; index += 1) binary += String.fromCharCode(bytes[index])
+  return btoa(binary)
+}
+
 function openImportModal() {
   const body = `<div class="transfer-grid">
     <div class="field"><label>选择 YAML / JSON 备份文件</label><input type="file" id="import-file" accept=".yml,.yaml,.json,.txt"></div>
@@ -895,10 +1195,17 @@ function openImportModal() {
 
 function openExportTaskPicker() {
   const tasks = state.data.tasks
+  const options = tasks.map(task => {
+    const standard = `<option value="${task.id}|standard">${esc(task.name)} — 标准报告（${esc(LABELS.taskStatus[task.status] ?? task.status)} · ${esc(task.id)}）</option>`
+    const skillReport = task.audit_mode === 'skill' && task.has_skill_report
+      ? `<option value="${task.id}|skill">${esc(task.name)} — Skill 报告（${esc(task.skill_name || 'Skill')}）</option>`
+      : ''
+    return standard + skillReport
+  }).join('')
   const body = tasks.length === 0
     ? '<div class="empty">暂无任务可导出。</div>'
-    : `<div class="field"><label>选择任务</label><select id="export-task">${tasks.map(task => `<option value="${task.id}">${esc(task.name)}（${esc(LABELS.taskStatus[task.status] ?? task.status)} · ${esc(task.id)}）</option>`).join('')}</select>
-        <div class="hint">任务审计到一半也可导出：报告包含已发现的漏洞，尚未审计的提示词以空章节保留。</div></div>
+    : `<div class="field"><label>选择任务与报告类型</label><select id="export-task">${options}</select>
+        <div class="hint">标准报告在任何阶段都可导出；Skill 报告仅在 Skill 模式任务提交过报告后出现。</div></div>
       <div class="field"><label>导出格式</label><select id="export-format">
         <option value="markdown">Markdown</option>
         <option value="html">HTML</option>
@@ -908,11 +1215,11 @@ function openExportTaskPicker() {
   openModal('导出审计报告', body, foot, modal => {
     modal.querySelector('[data-cancel]')?.addEventListener('click', closeModal)
     modal.querySelector('#export-go')?.addEventListener('click', () => {
-      const id = modal.querySelector('#export-task').value
+      const [id, type] = modal.querySelector('#export-task').value.split('|')
       const format = modal.querySelector('#export-format').value
-      download(`${API}/tasks/${id}/report?format=${format}`)
+      download(`${API}/tasks/${id}/report?format=${format}&type=${type}`)
       closeModal()
-      toast(`已开始导出 ${format} 报告`)
+      toast(`已开始导出${type === 'skill' ? ' Skill ' : ' '}报告（${format}）`)
     })
   })
 }
@@ -924,6 +1231,7 @@ async function handleAction(action, target) {
   const task = state.data.tasks.find(item => item.id === id)
   const finding = state.data.findings.find(item => item.id === id)
   const prompt = state.data.prompts.find(item => item.id === id)
+  const skill = state.data.skills.find(item => item.id === id)
 
   if (action === 'new-task') return openTaskModal(null)
   if (action === 'edit-task' && task) return openTaskModal(task)
@@ -931,10 +1239,21 @@ async function handleAction(action, target) {
   if (action === 'new-prompt') return openPromptModal(null)
   if (action === 'edit-prompt' && prompt) return openPromptModal(prompt)
   if (action === 'import-prompts') return openImportModal()
+  if (action === 'new-skill') return openSkillModal(null)
+  if (action === 'edit-skill' && skill) return openSkillModal(skill.id)
+  if (action === 'import-skills') return openSkillImportModal()
   if (action === 'export-task-report') return openExportTaskPicker()
   if (action === 'export-prompts') {
     download(`${API}/prompts/export`)
     return toast('已开始导出提示词 YAML')
+  }
+  if (action === 'export-skill' && skill) {
+    download(`${API}/skills/${skill.id}/export`)
+    return toast('已开始导出 Skill ZIP')
+  }
+  if (action === 'export-skills') {
+    download(`${API}/skills/export/zip`)
+    return toast('已开始导出全部 Skill ZIP')
   }
   if (action === 'finding-detail' && finding) return openFindingModal(finding)
 
@@ -1015,6 +1334,30 @@ async function handleAction(action, target) {
     try {
       await api(`/prompts/${prompt.id}`, { method: 'DELETE' })
       toast('提示词已删除')
+      await load({ silent: true })
+    } catch (error) {
+      toast(error.message, true)
+    }
+    return
+  }
+  if (action === 'toggle-skill' && skill) {
+    try {
+      await api(`/skills/${skill.id}`, {
+        method: 'PUT',
+        body: { enabled: target.dataset.enabled !== '1' },
+      })
+      toast(target.dataset.enabled === '1' ? 'Skill 已禁用' : 'Skill 已启用')
+      await load({ silent: true })
+    } catch (error) {
+      toast(error.message, true)
+    }
+    return
+  }
+  if (action === 'delete-skill' && skill) {
+    if (!confirm(`确定删除审计 Skill「${skill.name}」？已被任务引用的 Skill 删除后，相关任务需重新选择。`)) return
+    try {
+      await api(`/skills/${skill.id}`, { method: 'DELETE' })
+      toast('Skill 已删除')
       await load({ silent: true })
     } catch (error) {
       toast(error.message, true)

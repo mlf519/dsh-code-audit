@@ -1,6 +1,7 @@
 import { resolve } from 'node:path'
 import { createApiHandler } from './api.js'
 import { registerAuditCommand } from './commands.js'
+import { invalidateDshSkills, syncSkillToDsh } from './dshskills.js'
 import { AuditRunner } from './runner.js'
 import { AuditScheduler } from './scheduler.js'
 import { AuditStore } from './store.js'
@@ -21,6 +22,16 @@ export function apply(ctx, config = {}) {
   const log = message => console.warn(`[dsh-code-audit] ${message}`)
 
   const store = new AuditStore(dataDir)
+
+  // Keep the user-level DSH skill catalog in sync so existing audit skills
+  // are available as `/skill-name` outside the plugin console as well.
+  for (const skill of store.listSkills()) {
+    try {
+      syncSkillToDsh(skill, { log })
+    } catch (error) {
+      log(`同步 Skill 到 DSH 失败：${error?.message ?? error}`)
+    }
+  }
 
   ctx.effect(() => () => {
     scheduler.stop()
@@ -134,7 +145,11 @@ export function apply(ctx, config = {}) {
 
   // The web console binds to the host webServer once that service is available;
   // profiles without a Web surface simply never run this callback.
-  const handler = createApiHandler({ store, runner, scheduler, dataDir, listModels })
+  // Mutating `~/.dsh/skills` from this plugin must refresh DSH's skill catalog,
+  // otherwise a deleted skill keeps showing up as a dead `/skill-name` entry.
+  const invalidateSkills = () => invalidateDshSkills(ctx)
+
+  const handler = createApiHandler({ store, runner, scheduler, dataDir, listModels, invalidateSkills })
   ctx.inject(['webServer'], webCtx => {
     webCtx.effect(() => webCtx.webServer.register({
       kind: 'prefix',
