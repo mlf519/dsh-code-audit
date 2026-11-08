@@ -35,7 +35,6 @@ export function buildSkillMarkdown(skill) {
 
 /** Normalise untrusted skill input and keep the derived fields in sync. */
 export function normaliseSkillInput(input, current = {}) {
-  const hasSkillMarkdown = input.skill_md !== undefined
   const providedMarkdown = String(input.skill_md ?? '').trim()
     ? String(input.skill_md).replace(/\r\n/g, '\n')
     : ''
@@ -43,11 +42,11 @@ export function normaliseSkillInput(input, current = {}) {
   let parsed = { manifest: {}, body: '', name: '', description: '' }
   if (providedMarkdown) parsed = parseSkillMarkdown(providedMarkdown)
 
-  const name = String(input.name ?? parsed.name ?? current.name ?? '').trim()
+  const name = String(input.name || parsed.name || current.name || '').trim()
   if (!name) throw inputError('SKILL.md frontmatter 缺少 name，或未提供 Skill 名称')
 
   const description = String(
-    input.description ?? parsed.description ?? current.description ?? '',
+    input.description || parsed.description || current.description || '',
   ).trim()
   const content = parsed.body || String(input.content ?? current.content ?? '').replace(/\r\n/g, '\n')
   const references = input.references !== undefined
@@ -69,15 +68,6 @@ export function normaliseSkillInput(input, current = {}) {
     ? buildSkillMarkdown({ manifest, content, name, description, category })
     : providedMarkdown
 
-  let reportGuide
-  if (input.report_guide !== undefined) {
-    reportGuide = String(input.report_guide ?? '')
-  } else if (hasSkillMarkdown || input.references !== undefined) {
-    reportGuide = resolveReportGuide(references)
-  } else {
-    reportGuide = String(current.report_guide ?? '')
-  }
-
   return {
     name,
     category,
@@ -86,7 +76,6 @@ export function normaliseSkillInput(input, current = {}) {
     skill_md: skillMd,
     manifest,
     references,
-    report_guide: reportGuide,
     enabled: input.enabled === undefined ? (current.enabled ?? true) : Boolean(input.enabled),
   }
 }
@@ -103,18 +92,6 @@ export function normaliseReferences(references) {
     seen.set(path, { path, content })
   }
   return [...seen.values()]
-}
-
-/** Pick the report template reference when the skill does not declare one. */
-export function resolveReportGuide(references) {
-  const list = normaliseReferences(references)
-  const find = pattern => list.find(item => pattern.test(item.path))
-  const match = find(/audit-report-template\.(md|markdown)$/i)
-    || find(/(report-template|报告模板)\.(md|markdown)$/i)
-  if (match) return match.content
-  const fallback = list.find(item => /report.*template\.(md|markdown)$/i.test(item.path)
-    && !/poc|false-positive|误报/i.test(item.path))
-  return fallback?.content ?? ''
 }
 
 /** Compose the audit instruction body from the skill and its references. */

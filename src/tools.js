@@ -152,7 +152,7 @@ export async function registerAuditTools(ctx, { store, runner, dataDir, log = ()
 
   register(defineTool({
     name: 'code_audit_list_skills',
-    description: '列出可用的代码审计 Skill（名称、分类、说明、是否启用、是否规定报告格式）。',
+    description: '列出可用的代码审计 Skill（名称、分类、说明、是否启用）。',
     parameters: {},
     output: { schema: { type: 'json' }, render: (_args, value) => textResult(value) },
     async execute() {
@@ -164,7 +164,6 @@ export async function registerAuditTools(ctx, { store, runner, dataDir, log = ()
           description: skill.description,
           enabled: skill.enabled,
           builtin: skill.builtin,
-          has_report_guide: Boolean(String(skill.report_guide ?? '').trim()),
         })),
       }
     },
@@ -227,11 +226,11 @@ export async function registerAuditTools(ctx, { store, runner, dataDir, log = ()
 
   register(defineTool({
     name: 'code_audit_submit_skill_report',
-    description: 'Skill 模式审计结束时，按 Skill 规定的报告格式提交一份完整 Markdown 报告，用于插件归档与导出；不替代 Skill 要求的文件产出。',
+    description: '可选：提交一份按 Skill 生成的完整 Markdown 报告，用于插件归档与导出；不替代 Skill 要求的文件产出。',
     parameters: {
       content: {
         type: 'string',
-        description: '按 Skill 报告格式生成的完整 Markdown 报告内容',
+        description: '按 Skill 要求生成的完整 Markdown 报告内容',
         required: true,
       },
     },

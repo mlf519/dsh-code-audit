@@ -77,7 +77,6 @@ export function stringifySkillsDocument(skills) {
     lines.push(`    references: ${quoteScalar(JSON.stringify(skill.references ?? []))}`)
     appendBlockScalar(lines, 'skillMd', String(skill.skill_md ?? ''), 4)
     appendBlockScalar(lines, 'content', String(skill.content ?? ''), 4)
-    appendBlockScalar(lines, 'reportGuide', String(skill.report_guide ?? skill.reportGuide ?? ''), 4)
   }
   return `${lines.join('\n')}\n`
 }
@@ -103,7 +102,6 @@ export function parseSkillsDocument(text) {
       description: String(item.description ?? '').trim(),
       enabled: item.enabled === undefined ? true : item.enabled !== false,
       content: String(item.content ?? ''),
-      report_guide: String(item.reportGuide ?? item.report_guide ?? ''),
       skill_md: String(item.skillMd ?? item.skill_md ?? ''),
       references: parseReferences(item.references),
     }))

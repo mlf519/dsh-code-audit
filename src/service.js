@@ -168,7 +168,6 @@ function skillSummary(skill) {
     preview: String(skill.content ?? '').replace(/\s+/g, ' ').trim().slice(0, 160),
     reference_paths: references.map(reference => reference.path),
     has_skill_md: Boolean(String(skill.skill_md ?? '').trim()),
-    has_report_guide: Boolean(String(skill.report_guide ?? '').trim()),
   }
 }
 

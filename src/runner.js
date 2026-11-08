@@ -3,7 +3,7 @@ import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { rescheduleAfterRun } from './schedule.js'
 import { findDshSkillMirror, invalidateDshSkills, syncSkillToDsh } from './dshskills.js'
-import { resolveReportGuide, skillPromptContent } from './skillpack.js'
+import { skillPromptContent } from './skillpack.js'
 import { clip, nowIso } from './util.js'
 
 /** Drives audit runs by creating isolated DSH agent sessions. */
@@ -530,10 +530,6 @@ export class AuditRunner {
   submitSkillReport(context, content) {
     const task = this.store.getTask(context.taskId)
     if (!task || task.audit_mode !== 'skill') throw new Error('只有 Skill 模式的审计任务可以提交 Skill 报告')
-    const skill = task.skill_id ? this.store.getSkill(task.skill_id) : undefined
-    const reportGuide = String(skill?.report_guide ?? '').trim()
-      || resolveReportGuide(skill?.references ?? [])
-    if (!skill || !reportGuide) throw new Error('当前审计 Skill 没有规定报告格式')
     const text = String(content ?? '').trim()
     if (!text) throw new Error('Skill 报告内容不能为空')
     this.store.updateRun(context.runId, { skill_report: clip(text, 200000) })
@@ -781,7 +777,6 @@ ${sections.join('\n\n')}
 
 /** Compose the audit instruction for a task driven by a code audit Skill. */
 export function buildSkillAuditPrompt(task, skill, mirror = null) {
-  const reportGuide = String(skill.report_guide ?? '').trim()
   const native = Boolean(mirror?.name)
   const skillSection = native
     ? `# Skill 调用（必须遵守）
@@ -790,17 +785,6 @@ export function buildSkillAuditPrompt(task, skill, mirror = null) {
 如果 DSH 未自动加载该 Skill，请直接读取 ${join(mirror.dir, 'SKILL.md')} 作为审计规定。`
     : `# Skill 规定（必须遵守）
 ${skillPromptContent(skill) || '（该 Skill 未提供具体审计规定）'}`
-  const reportSection = reportGuide
-    ? `
-# Skill 报告格式（由 Skill 规定，必须遵循）
-报告的结构、章节、字段与措辞全部按该 Skill 的规定生成；本插件不改变、不简化报告要求：
-
-${reportGuide}
-`
-    : ''
-  const reportRequirement = reportGuide
-    ? '- 按 Skill 规定生成完整报告。若 Skill 要求写入项目目录，照 Skill 执行；同时把同一份报告内容通过 `code_audit_submit_skill_report` 提交一次，供插件归档与导出。'
-    : '- 该 Skill 未规定报告格式：若 Skill 要求写文件，照 Skill 执行；如有最终报告，也通过 `code_audit_submit_skill_report` 提交一份，便于插件导出。'
   const callLine = native ? `/${mirror.name}\n\n` : ''
 
   return `${callLine}你是一名资深代码安全审计工程师，正在按照指定的审计 Skill 执行一个自动化的代码审计任务。
@@ -843,10 +827,8 @@ ${skillSection}
 - poc_request：可利用漏洞必须提供 PoC 请求包示例。包含（1）原始 HTTP 请求：请求行、Host、必要的 Cookie/Token/Content-Type 等 Header、Body；（2）一条把同一请求写成可直接执行的 curl 命令。仅当漏洞无法通过 HTTP 触发（如本地条件、需依赖内部状态）时留空，并在 evidence 中说明复现步骤。
 - prompt_name：Skill 模式下无需填写。
 
-${reportSection}
 # 结束要求
 - 先完成 Skill 规定的全部步骤与产出（含 Skill 要求的文件写入 / 报告），再做插件侧归档。
 - 调用 \`code_audit_submit_summary\` 输出本次审计总结：Skill 覆盖范围、发现数量、未覆盖或未发现问题的原因。
-${reportRequirement}
 如果本次没有任何发现，也必须调用 \`code_audit_submit_summary\` 说明"未发现符合条件的问题"，不要直接结束。`
 }

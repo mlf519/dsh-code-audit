@@ -486,7 +486,6 @@ function renderSkills() {
       ${skill.builtin ? '<span>内置</span>' : '<span>自定义</span>'}
       <span>分类：${esc(skill.category || '未分类')}</span>
       <span>${(skill.reference_paths ?? []).length} 个参考文件</span>
-      <span>${skill.has_report_guide ? '含报告格式' : '无报告格式'}</span>
     </div>
     <div class="preview">${esc(String(skill.description || skill.preview || '').slice(0, 260))}</div>
     <footer>
@@ -499,7 +498,7 @@ function renderSkills() {
 
   return `
     <div class="panel-head">
-      <div><h2>代码审计 Skill</h2><div class="sub">Skill 使用标准 SKILL.md（YAML frontmatter + Markdown 正文）与 references/ 参考文件；保存或导入后会自动同步到 <code>~/.dsh/skills</code>，可直接在会话中用 <code>/名称</code> 调用。新建任务时也可选择按 Skill 执行，并同时导出标准报告与 Skill 报告。</div></div>
+      <div><h2>代码审计 Skill</h2><div class="sub">Skill 使用标准 SKILL.md（YAML frontmatter + Markdown 正文）与 references/ 参考文件；保存或导入后会自动同步到 <code>~/.dsh/skills</code>，可直接在会话中用 <code>/名称</code> 调用。新建任务时也可选择按 Skill 执行，审计过程完全遵循该 Skill 的规定。</div></div>
       <div class="panel-actions">
         <button class="btn primary" data-action="new-skill">新建 Skill</button>
         <button class="btn" data-action="import-skills">导入 Skill</button>
@@ -668,19 +667,21 @@ async function openTaskModal(task) {
   const auditMode = task?.audit_mode === 'skill' ? 'skill' : 'prompts'
   const skills = state.data.skills
   const currentSkillId = task?.skill_id ?? ''
+  const enabledSkills = skills.filter(skill => skill.enabled)
+  const currentSkillAvailable = enabledSkills.some(skill => skill.id === currentSkillId)
   const skillOptions = [
-    currentSkillId && !skills.some(skill => skill.id === currentSkillId)
-      ? `<option value="${esc(currentSkillId)}" selected>（原 Skill 已删除，请重新选择）</option>`
+    currentSkillId && !currentSkillAvailable
+      ? '<option value="" selected>（原 Skill 已禁用或删除，请重新选择）</option>'
       : '',
-    ...skills
-      .filter(skill => skill.enabled || skill.id === currentSkillId)
-      .map(skill => `<option value="${skill.id}" ${skill.id === currentSkillId ? 'selected' : ''}>${esc(skill.name)}${skill.enabled ? '' : '（已禁用）'}</option>`),
+    ...enabledSkills
+      .map(skill => `<option value="${skill.id}" ${skill.id === currentSkillId ? 'selected' : ''}>${esc(skill.name)}</option>`),
   ].join('')
-  const promptList = prompts.length === 0
-    ? '<div class="path">暂无提示词，请先在「审计提示词」中创建。</div>'
-    : prompts.map(prompt => `<label class="prompt-item ${selected.has(prompt.id) ? 'selected' : ''}" data-prompt-id="${prompt.id}">
+  const enabledPrompts = prompts.filter(prompt => prompt.enabled)
+  const promptList = enabledPrompts.length === 0
+    ? '<div class="path">暂无启用的提示词，请先在「审计提示词」中启用或创建。</div>'
+    : enabledPrompts.map(prompt => `<label class="prompt-item ${selected.has(prompt.id) ? 'selected' : ''}" data-prompt-id="${prompt.id}">
         <input type="checkbox" value="${prompt.id}" ${selected.has(prompt.id) ? 'checked' : ''}>
-        <span><span class="name">${esc(prompt.name)}</span><br><span class="meta">${esc(prompt.category || '未分类')} · ${esc(LABELS.severity[prompt.default_severity] ?? prompt.default_severity)}${prompt.enabled ? '' : ' · 已禁用，不会参与审计'}</span></span>
+        <span><span class="name">${esc(prompt.name)}</span><br><span class="meta">${esc(prompt.category || '未分类')} · ${esc(LABELS.severity[prompt.default_severity] ?? prompt.default_severity)}</span></span>
       </label>`).join('')
 
   const models = await ensureModels()
@@ -706,7 +707,7 @@ async function openTaskModal(task) {
           </label>
           <label class="mode-option ${auditMode === 'skill' ? 'active' : ''}" data-mode="skill">
             <input type="radio" name="audit_mode" value="skill" ${auditMode === 'skill' ? 'checked' : ''}>
-            <span><b>按审计 Skill</b><small>完全按照所选 Skill 规定执行，可输出 Skill 自定义报告。</small></span>
+            <span><b>按审计 Skill</b><small>完全按照所选 Skill 的规定执行审计。</small></span>
           </label>
         </div>
       </div>
@@ -725,7 +726,7 @@ async function openTaskModal(task) {
         <select name="skill_id">
           ${skillOptions || '<option value="">暂无可用 Skill，请先在「审计 Skill」中创建</option>'}
         </select>
-        <div class="hint">Agent 会严格按该 Skill 的规定执行审计；若 Skill 规定了报告格式，还会生成一份 Skill 报告。</div>
+        <div class="hint">Agent 会严格按该 Skill 的规定执行审计（含 Skill 要求的报告与文件产出），本插件只附加进度上报、漏洞记录与报告导出。</div>
       </div>
       <div class="field"><label>调度方式</label><select name="schedule_type">
         ${Object.entries(LABELS.schedule).map(([value, label]) => `<option value="${value}" ${scheduleType === value ? 'selected' : ''}>${label}</option>`).join('')}
@@ -844,35 +845,25 @@ async function openTaskModal(task) {
 }
 
 function openReportModal(task) {
-  const skillMode = task.audit_mode === 'skill'
-  const hasSkillReport = Boolean(task.has_skill_report)
-  const formatButtons = type => ['markdown', 'html', 'json']
-    .map(format => `<button class="btn" data-format="${format}" data-type="${type}" type="button">${format === 'markdown' ? 'Markdown' : format.toUpperCase()}</button>`)
+  const formatButtons = ['markdown', 'html', 'json']
+    .map(format => `<button class="btn" data-format="${format}" type="button">${format === 'markdown' ? 'Markdown' : format.toUpperCase()}</button>`)
     .join('')
-  const skillBlock = skillMode
-    ? `<div class="report-group">
-        <div class="group-head">Skill 报告</div>
-        ${hasSkillReport
-          ? `<div class="btn-group">${formatButtons('skill')}</div><div class="hint">按 Skill 规定的报告格式生成，来自最近一次已提交的 Skill 报告。</div>`
-          : '<div class="hint">最近一次运行还没有提交 Skill 报告；完成 Skill 模式审计后可导出。</div>'}
-      </div>`
-    : ''
   const body = `
     <p class="prose">任务审计到一半也可导出标准报告：报告包含当前已发现的漏洞，尚未审计的范围以空章节保留。</p>
     <div class="report-group">
       <div class="group-head">标准审计报告</div>
-      <div class="btn-group">${formatButtons('standard')}</div>
+      <div class="btn-group">${formatButtons}</div>
       <div class="hint">统一格式，包含报告信息、执行摘要、覆盖范围、漏洞详情、PoC 请求包与运行历史。</div>
-    </div>
-    ${skillBlock}`
+    </div>`
   const foot = `<button class="btn ghost" data-cancel="1" type="button">关闭</button>`
   openModal(`导出报告 · ${task.name}`, body, foot, modal => {
     modal.querySelector('[data-cancel]')?.addEventListener('click', closeModal)
     modal.querySelectorAll('[data-format]').forEach(button => {
       button.addEventListener('click', () => {
-        const type = button.dataset.type
-        download(`${API}/tasks/${task.id}/report?format=${button.dataset.format}&type=${type}`)
-        toast(`已开始导出${type === 'skill' ? ' Skill ' : ' '}报告（${button.dataset.format}）`)
+        const format = button.dataset.format
+        closeModal()
+        download(`${API}/tasks/${task.id}/report?format=${format}&type=standard`)
+        toast(`已开始导出报告（${format}）`)
       })
     })
   })
@@ -1002,11 +993,7 @@ async function openSkillModal(skillId) {
         <label>参考文件（references/）</label>
         <div id="skill-refs" class="ref-list">${references.map(reference => refRow(reference.path, reference.content)).join('')}</div>
         <div class="ref-actions"><button type="button" class="btn small" id="skill-ref-add">添加参考文件</button></div>
-        <div class="hint">会随 SKILL.md 一起保存并导出为 ZIP；审计时自动内联。若包含 <code>audit-report-template.md</code>，将自动作为 Skill 报告格式。</div>
-      </div>
-      <div class="field full">
-        <label class="checkbox-line"><input type="checkbox" name="auto_report" ${skill?.report_guide ? '' : 'checked'}> 自动从参考文件识别报告格式</label>
-        <textarea name="report_guide" rows="6" placeholder="取消勾选后可手动填写报告格式指南；留空则不生成 Skill 报告。">${esc(skill?.report_guide ?? '')}</textarea>
+        <div class="hint">会随 SKILL.md 一起保存并导出为 ZIP；审计时自动内联。</div>
       </div>
       <div class="field full"><label class="checkbox-line"><input type="checkbox" name="enabled" ${skill?.enabled === false ? '' : 'checked'}> 启用</label></div>
     </form>`
@@ -1016,13 +1003,6 @@ async function openSkillModal(skillId) {
     <button class="btn primary" type="submit" form="skill-form">${skill ? '保存' : '创建'}</button>`
   openModal(skill ? '编辑审计 Skill' : '新建审计 Skill', body, foot, modal => {
     const refs = modal.querySelector('#skill-refs')
-    const autoReport = modal.querySelector('[name="auto_report"]')
-    const reportGuide = modal.querySelector('[name="report_guide"]')
-    const updateReportState = () => {
-      reportGuide.disabled = Boolean(autoReport?.checked)
-    }
-    updateReportState()
-    autoReport?.addEventListener('change', updateReportState)
     modal.querySelector('#skill-ref-add')?.addEventListener('click', () => {
       refs.insertAdjacentHTML('beforeend', refRow('', ''))
     })
@@ -1060,7 +1040,6 @@ async function openSkillModal(skillId) {
         references,
         enabled: data.get('enabled') === 'on',
       }
-      if (data.get('auto_report') !== 'on') payload.report_guide = String(data.get('report_guide') ?? '')
       try {
         const saved = skill
           ? await api(`/skills/${skill.id}`, { method: 'PUT', body: payload })
@@ -1195,17 +1174,13 @@ function openImportModal() {
 
 function openExportTaskPicker() {
   const tasks = state.data.tasks
-  const options = tasks.map(task => {
-    const standard = `<option value="${task.id}|standard">${esc(task.name)} — 标准报告（${esc(LABELS.taskStatus[task.status] ?? task.status)} · ${esc(task.id)}）</option>`
-    const skillReport = task.audit_mode === 'skill' && task.has_skill_report
-      ? `<option value="${task.id}|skill">${esc(task.name)} — Skill 报告（${esc(task.skill_name || 'Skill')}）</option>`
-      : ''
-    return standard + skillReport
-  }).join('')
+  const options = tasks.map(task =>
+    `<option value="${task.id}">${esc(task.name)} — 标准报告（${esc(LABELS.taskStatus[task.status] ?? task.status)} · ${esc(task.id)})</option>`,
+  ).join('')
   const body = tasks.length === 0
     ? '<div class="empty">暂无任务可导出。</div>'
-    : `<div class="field"><label>选择任务与报告类型</label><select id="export-task">${options}</select>
-        <div class="hint">标准报告在任何阶段都可导出；Skill 报告仅在 Skill 模式任务提交过报告后出现。</div></div>
+    : `<div class="field"><label>选择任务</label><select id="export-task">${options}</select>
+        <div class="hint">标准报告在任何阶段都可导出；审计进行中导出时，尚未审计的范围以空章节保留。</div></div>
       <div class="field"><label>导出格式</label><select id="export-format">
         <option value="markdown">Markdown</option>
         <option value="html">HTML</option>
@@ -1215,11 +1190,11 @@ function openExportTaskPicker() {
   openModal('导出审计报告', body, foot, modal => {
     modal.querySelector('[data-cancel]')?.addEventListener('click', closeModal)
     modal.querySelector('#export-go')?.addEventListener('click', () => {
-      const [id, type] = modal.querySelector('#export-task').value.split('|')
+      const id = modal.querySelector('#export-task').value
       const format = modal.querySelector('#export-format').value
-      download(`${API}/tasks/${id}/report?format=${format}&type=${type}`)
       closeModal()
-      toast(`已开始导出${type === 'skill' ? ' Skill ' : ' '}报告（${format}）`)
+      download(`${API}/tasks/${id}/report?format=${format}&type=standard`)
+      toast(`已开始导出报告（${format}）`)
     })
   })
 }
