@@ -12,3 +12,14 @@ keystore.properties
 keystore/
 *.jks
 *.keystore
+
+HanakoAI-main/
+HanakoAI-main.zip
+composeApp/
+gradle/
+gradlew
+gradlew.bat
+gradle.properties
+settings.gradle.kts
+build.gradle.kts
+.trae-html-share-packages/
