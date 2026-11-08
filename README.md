@@ -2,7 +2,7 @@
 
 DeepSeek Harness（DSH）代码审计插件：用任务化的方式管理代码审计，可按所选漏洞提示词或审计 Skill 驱动 DSH 原生 Agent 会话进行审计，沉淀漏洞、进度与运行轨迹，并导出可直接交付的专业审计报告。
 
-当前版本：**0.4.1** ｜ 兼容 DSH `>=0.1.1-rc.2 <0.3.0`（含 0.2.x）
+当前版本：**0.4.2** ｜ 兼容 DSH `>=0.1.1-rc.2 <0.3.0`（含 0.2.x）
 
 ## 功能特性
 
@@ -50,7 +50,7 @@ DeepSeek Harness（DSH）代码审计插件：用任务化的方式管理代码�
 - 导出支持：单个 Skill 导出为 `SKILL.md + references/` 的 ZIP；也可一键导出全部 Skill 为多目录 ZIP；仍保留旧版 YAML 备份导出。
 - 审计时优先走 DSH 原生 Skill 调用：审计提示词以 `/skill-name` 开头，由 DSH 加载 `SKILL.md` 正文、Agent 按需读取 `references/` 下的文件；仅当该 Skill 未镜像成功（名称非法或与第三方 Skill 同名冲突）时，才回退为正文 + 全部参考文件内联。
 - 若 `references/` 中包含 `audit-report-template.md`，会自动识别为「报告格式指南」；也可在编辑器中手动覆盖。审计结束时 Agent 按该格式提交 Markdown 报告，可在任务中单独导出 Skill 报告。
-- 若 Skill 原文要求把报告写入被审计项目目录（如 `reports/`），插件会改为要求通过 `code_audit_submit_skill_report` 提交，保持被审计仓库只读。
+- Skill 模式的审计要求以 Skill 为唯一权威：审计范围、步骤、判定标准、报告格式与产出位置全部按 Skill 执行；插件只附加进度上报、漏洞记录与报告导出，不改变或削弱 Skill 要求。Skill 要求写入文件（如 `reports/`）时按 Skill 执行，这是只读约束的唯一例外；同一份报告再通过 `code_audit_submit_skill_report` 提交一次用于归档导出。
 - 任务引用的 Skill 被删除后，任务会明确提示重新选择，不会静默回退。
 
 ### 专业审计报告

@@ -792,16 +792,15 @@ export function buildSkillAuditPrompt(task, skill, mirror = null) {
 ${skillPromptContent(skill) || '（该 Skill 未提供具体审计规定）'}`
   const reportSection = reportGuide
     ? `
-# Skill 报告（必须提交）
-本次审计结束后，必须调用工具 \`code_audit_submit_skill_report\` 提交一份完整报告，content 参数为 Markdown 文本。
-报告必须严格遵循该 Skill 规定的格式：
+# Skill 报告格式（由 Skill 规定，必须遵循）
+报告的结构、章节、字段与措辞全部按该 Skill 的规定生成；本插件不改变、不简化报告要求：
 
 ${reportGuide}
 `
     : ''
   const reportRequirement = reportGuide
-    ? '- 结束前调用 `code_audit_submit_skill_report`，按 Skill 规定的报告格式提交 Markdown 报告。'
-    : '- 该 Skill 未规定报告格式，无需提交 Skill 报告。'
+    ? '- 按 Skill 规定生成完整报告。若 Skill 要求写入项目目录，照 Skill 执行；同时把同一份报告内容通过 `code_audit_submit_skill_report` 提交一次，供插件归档与导出。'
+    : '- 该 Skill 未规定报告格式：若 Skill 要求写文件，照 Skill 执行；如有最终报告，也通过 `code_audit_submit_skill_report` 提交一份，便于插件导出。'
   const callLine = native ? `/${mirror.name}\n\n` : ''
 
   return `${callLine}你是一名资深代码安全审计工程师，正在按照指定的审计 Skill 执行一个自动化的代码审计任务。
@@ -818,18 +817,19 @@ ${reportGuide}
 
 ${skillSection}
 
-# 审计范围约束
-- 严格按照该 Skill 规定的审计范围、检查项与判定标准执行；Skill 未要求的内容不要审计、不要报告。
-- 必须使用只读方式查看代码，禁止修改、创建、删除仓库中的任何文件，禁止执行会产生副作用的命令。
-- 如果 Skill 要求把报告写入被审计项目的某个目录（例如 reports/），不要创建文件；改为通过 \`code_audit_submit_skill_report\` 提交完整报告内容。
+# 审计要求的优先级（必须遵守）
+- 该 Skill 是本任务的唯一权威：审计范围、检查项、判定标准、执行步骤、工具用法、报告格式与产出位置全部严格按 Skill 执行；Skill 未要求的内容不要审计、不要报告。
+- 本插件只提供附加能力（进度上报、漏洞记录、报告归档 / 导出），不得改变、简化、跳过或削弱 Skill 的任何审计要求、步骤与技巧；两者冲突时以 Skill 为准。
+- Skill 要求写入文件时（例如把报告写入被审计项目的 \`reports/\`、生成清单或 PoC 文件），按 Skill 要求创建这些文件，这是只读约束的唯一例外，不得因为插件而省略该产出。
+- Skill 未要求写入的场景，仍以只读方式查看代码，不要修改仓库中的其他文件，不要执行会产生副作用的命令。
 - 所有文件路径使用相对审计目录的路径，禁止使用绝对路径。
 - 只报告有明确代码证据的问题；不确定、无法定位到具体代码的猜测不要上报。
 
-# 进度上报（必须遵守）
-- 开始审计前，调用工具 \`code_audit_report_progress\`，参数 prompt_name 为 "${skill.name}"，status 为 started。
+# 进度上报（附加能力，不影响 Skill 流程）
+- 按 Skill 规定的流程审计；在不打断 Skill 步骤的前提下，开始前调用工具 \`code_audit_report_progress\`，参数 prompt_name 为 "${skill.name}"，status 为 started。
 - 审计完成后再次调用，status 为 done，note 用一句话说明结果，例如"已检查 18 个文件，发现 2 个问题"。
 
-# 上报方式（必须遵守）
+# 漏洞记录（附加能力，不改变 Skill 判定）
 每确认一个漏洞，调用工具 \`code_audit_submit_finding\`，参数含义：
 - title：简短明确的漏洞标题
 - severity：critical / high / medium / low / info 之一
@@ -845,6 +845,7 @@ ${skillSection}
 
 ${reportSection}
 # 结束要求
+- 先完成 Skill 规定的全部步骤与产出（含 Skill 要求的文件写入 / 报告），再做插件侧归档。
 - 调用 \`code_audit_submit_summary\` 输出本次审计总结：Skill 覆盖范围、发现数量、未覆盖或未发现问题的原因。
 ${reportRequirement}
 如果本次没有任何发现，也必须调用 \`code_audit_submit_summary\` 说明"未发现符合条件的问题"，不要直接结束。`

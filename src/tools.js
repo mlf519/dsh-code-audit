@@ -227,7 +227,7 @@ export async function registerAuditTools(ctx, { store, runner, dataDir, log = ()
 
   register(defineTool({
     name: 'code_audit_submit_skill_report',
-    description: '在 Skill 模式的代码审计结束时，按 Skill 规定的报告格式提交完整的 Markdown 报告。',
+    description: 'Skill 模式审计结束时，按 Skill 规定的报告格式提交一份完整 Markdown 报告，用于插件归档与导出；不替代 Skill 要求的文件产出。',
     parameters: {
       content: {
         type: 'string',
