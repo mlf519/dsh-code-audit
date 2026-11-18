@@ -1,12 +1,12 @@
 const API = '/dsh-code-audit/api'
 
 const LABELS = {
-  taskStatus: { draft: '草稿', scheduled: '已排期', running: '运行中', completed: '已完成', failed: '失败', cancelled: '已取消' },
+  taskStatus: { draft: '草稿', scheduled: '已排期', running: '运行中', paused: '已暂停', completed: '已完成', failed: '失败', cancelled: '已取消' },
   findingStatus: { open: '待确认', verified: '已确认', ignored: '已忽略', false_positive: '误报', fixed: '已修复' },
   severity: { critical: '严重', high: '高危', medium: '中危', low: '低危', info: '提示' },
   trigger: { manual: '手动', schedule: '定时', tool: 'Agent 工具' },
   schedule: { manual: '手动触发', once: '定时一次', cron: 'Cron 周期', interval: '固定间隔' },
-  runStatus: { running: '运行中', completed: '已完成', failed: '失败', cancelled: '已取消' },
+  runStatus: { running: '运行中', paused: '已暂停', completed: '已完成', failed: '失败', cancelled: '已取消' },
 }
 
 const state = {
@@ -318,7 +318,7 @@ function renderStats() {
   const stats = state.data.stats
   const cards = [
     { label: '审计任务', value: stats.tasks, hint: `${stats.scheduled} 个已排期` },
-    { label: '运行中', value: stats.running, hint: '并发审计会话' },
+    { label: '运行中', value: stats.running, hint: stats.paused ? `${stats.paused} 个已暂停` : '并发审计会话' },
     { label: '待确认漏洞', value: stats.openFindings, hint: '需要人工复核' },
     { label: '已确认漏洞', value: stats.verifiedFindings, hint: '验证通过的风险' },
     { label: '已忽略/误报', value: stats.ignoredFindings, hint: '不再跟踪' },
@@ -354,6 +354,7 @@ function renderTasks() {
   const tasks = state.data.tasks
   const rows = tasks.map(task => {
     const running = task.status === 'running'
+    const paused = task.status === 'paused'
     const promptNames = task.prompt_names.length
       ? task.prompt_names.map(name => `<span class="badge info">${esc(name)}</span>`).join(' ')
       : '<span class="path">未选择提示词</span>'
@@ -369,17 +370,19 @@ function renderTasks() {
       <td class="title-cell">${taskLabel(task)}<small>${esc(task.repo_path)}</small></td>
       <td>${scope}</td>
       <td class="nowrap">${schedule}</td>
-      <td>${badge(task.status, LABELS.taskStatus[task.status] ?? task.status)}${task.enabled ? '' : ' <span class="path">已暂停</span>'}</td>
+      <td>${badge(task.status, LABELS.taskStatus[task.status] ?? task.status)}${task.enabled ? '' : ' <span class="path">调度停用</span>'}</td>
       <td>${progressHtml(task.latest_run)}</td>
       <td class="nowrap">${task.finding_stats.total} 个 / 待确认 ${task.finding_stats.open}</td>
       <td class="nowrap">${esc(fmtDate(task.last_run_at))}</td>
       <td class="nowrap"><div class="btn-group">
         ${running
-          ? `<button class="btn small danger" data-action="cancel-task" data-id="${task.id}">取消</button>`
-          : `<button class="btn small primary" data-action="run-task" data-id="${task.id}">运行</button>`}
+          ? `<button class="btn small" data-action="pause-task" data-id="${task.id}">暂停</button><button class="btn small danger" data-action="cancel-task" data-id="${task.id}">取消</button>`
+          : paused
+            ? `<button class="btn small primary" data-action="resume-task" data-id="${task.id}">继续</button><button class="btn small" data-action="run-task" data-id="${task.id}">重新开始</button>`
+            : `<button class="btn small primary" data-action="run-task" data-id="${task.id}">运行</button>`}
         <button class="btn small" data-action="edit-task" data-id="${task.id}">编辑</button>
         <button class="btn small" data-action="report-task" data-id="${task.id}">导出报告</button>
-        <button class="btn small" data-action="toggle-task" data-id="${task.id}" data-enabled="${task.enabled ? '1' : '0'}">${task.enabled ? '暂停' : '启用'}</button>
+        <button class="btn small" data-action="toggle-task" data-id="${task.id}" data-enabled="${task.enabled ? '1' : '0'}">${task.enabled ? '停用调度' : '启用调度'}</button>
         <button class="btn small danger" data-action="delete-task" data-id="${task.id}">删除</button>
       </div></td>
     </tr>`
@@ -521,8 +524,10 @@ function renderRuns() {
     <td class="nowrap"><div class="btn-group">
       <button class="btn small" data-action="trajectory-run" data-id="${run.id}">轨迹 JSONL</button>
       ${run.status === 'running'
-        ? `<button class="btn small danger" data-action="cancel-run" data-id="${run.id}">取消</button>`
-        : `<button class="btn small danger" data-action="delete-run" data-id="${run.id}">删除</button>`}
+        ? `<button class="btn small" data-action="pause-run" data-id="${run.id}">暂停</button><button class="btn small danger" data-action="cancel-run" data-id="${run.id}">取消</button>`
+        : run.status === 'paused'
+          ? `<button class="btn small primary" data-action="resume-run" data-id="${run.id}">继续</button><button class="btn small danger" data-action="cancel-run" data-id="${run.id}">取消</button>`
+          : `<button class="btn small danger" data-action="delete-run" data-id="${run.id}">删除</button>`}
     </div></td>
   </tr>`).join('')
 
@@ -538,14 +543,13 @@ function renderRuns() {
 function renderSettings() {
   const settings = state.data.settings
   return `
-    <div class="panel-head"><div><h2>设置</h2><div class="sub">运行并发、超时、自动续跑与默认模型。修改会立即生效。</div></div></div>
+    <div class="panel-head"><div><h2>设置</h2><div class="sub">运行并发、自动续跑与默认模型。修改会立即生效。</div></div></div>
     <div class="panel-body">
       <div class="settings-card">
         <h3>运行设置</h3>
-        <div class="hint">并发数限制同时运行的审计会话；超时设为 0 表示不限制。</div>
+        <div class="hint">审计不设总时长限制，模型持续回复时任务会一直保持运行并实时更新进度。</div>
         <form id="settings-form" class="form-grid">
           <div class="field"><label>最大并发审计数</label><input type="number" min="1" step="1" name="maxConcurrentRuns" value="${esc(settings.maxConcurrentRuns ?? 1)}"></div>
-          <div class="field"><label>单次审计超时（分钟）</label><input type="number" min="0" step="1" name="runTimeoutMinutes" value="${esc(settings.runTimeoutMinutes ?? 60)}"></div>
           <div class="field"><label>模型回复失败后自动续跑间隔（分钟）</label><input type="number" min="0" max="1440" step="1" name="llmRetryDelayMinutes" value="${esc(settings.llmRetryDelayMinutes ?? 5)}"><div class="hint">回复超时/失败后等待多久自动发送「继续」，0 表示立即，最大 1440（24 小时）。</div></div>
           <div class="field"><label>自动续跑次数上限</label><input type="number" min="0" max="100" step="1" name="llmRetryCount" value="${esc(settings.llmRetryCount ?? 3)}"><div class="hint">达到次数仍未成功才判定任务失败；0 表示不自动续跑。</div></div>
           <div class="field"><label>默认模型服务商（可选）</label><input name="defaultProvider" placeholder="例如 deepseek" value="${esc(settings.defaultProvider ?? '')}"><div class="hint">留空使用 DSH 默认模型。</div></div>
@@ -600,7 +604,6 @@ function bindPanelExtras() {
           method: 'PUT',
           body: {
             maxConcurrentRuns: Number(data.get('maxConcurrentRuns')),
-            runTimeoutMinutes: Number(data.get('runTimeoutMinutes')),
             llmRetryDelayMinutes: Number(data.get('llmRetryDelayMinutes')),
             llmRetryCount: Number(data.get('llmRetryCount')),
             defaultProvider: String(data.get('defaultProvider') ?? ''),
@@ -735,7 +738,7 @@ async function openTaskModal(task) {
       <div class="field" id="field-cron" ${scheduleType === 'cron' ? '' : 'hidden'}><label>Cron 表达式</label><input name="schedule_cron" value="${esc(task?.schedule_cron ?? '')}" placeholder="0 2 * * *"><div class="hint">5 字段：分 时 日 月 周。</div></div>
       <div class="field" id="field-interval" ${scheduleType === 'interval' ? '' : 'hidden'}><label>间隔分钟数</label><input type="number" min="1" step="1" name="interval_minutes" value="${esc(task?.interval_minutes ?? 60)}"></div>
       ${modelFieldHtml(models, task)}
-      <div class="field full"><label class="checkbox-line"><input type="checkbox" name="enabled" ${task?.enabled === false ? '' : 'checked'}> 启用任务（暂停后不会按计划执行）</label></div>
+      <div class="field full"><label class="checkbox-line"><input type="checkbox" name="enabled" ${task?.enabled === false ? '' : 'checked'}> 启用调度（停用后不会按计划自动执行）</label></div>
     </form>`
   const foot = `<button class="btn ghost" data-cancel="1" type="button">取消</button><button class="btn primary" type="submit" form="task-form">${task ? '保存修改' : '创建任务'}</button>`
 
@@ -1254,10 +1257,30 @@ async function handleAction(action, target) {
     }
     return
   }
+  if (action === 'pause-task' && task) {
+    try {
+      await api(`/tasks/${task.id}/pause`, { method: 'POST' })
+      toast('已暂停审计，点击「继续」可从中断点恢复')
+      await load({ silent: true })
+    } catch (error) {
+      toast(error.message, true)
+    }
+    return
+  }
+  if (action === 'resume-task' && task) {
+    try {
+      await api(`/tasks/${task.id}/resume`, { method: 'POST' })
+      toast('已从暂停点继续审计')
+      await load({ silent: true })
+    } catch (error) {
+      toast(error.message, true)
+    }
+    return
+  }
   if (action === 'toggle-task' && task) {
     try {
       await api(`/tasks/${task.id}/toggle`, { method: 'POST', body: { enabled: target.dataset.enabled !== '1' } })
-      toast(target.dataset.enabled === '1' ? '任务已暂停' : '任务已启用')
+      toast(target.dataset.enabled === '1' ? '已停用调度' : '已启用调度')
       await load({ silent: true })
     } catch (error) {
       toast(error.message, true)
@@ -1342,6 +1365,26 @@ async function handleAction(action, target) {
   if (action === 'trajectory-run') {
     download(`${API}/runs/${id}/trajectory`)
     return toast('已开始下载轨迹 JSONL')
+  }
+  if (action === 'pause-run') {
+    try {
+      await api(`/runs/${id}/pause`, { method: 'POST' })
+      toast('已暂停运行，点击「继续」可从中断点恢复')
+      await load({ silent: true })
+    } catch (error) {
+      toast(error.message, true)
+    }
+    return
+  }
+  if (action === 'resume-run') {
+    try {
+      await api(`/runs/${id}/resume`, { method: 'POST' })
+      toast('已从暂停点继续运行')
+      await load({ silent: true })
+    } catch (error) {
+      toast(error.message, true)
+    }
+    return
   }
   if (action === 'cancel-run') {
     try {

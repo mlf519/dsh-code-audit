@@ -10,6 +10,7 @@
       # config:
       #   dataDir: !!js dshHomePath('storages', 'code-audit')
       #   maxConcurrentRuns: 2
-      #   runTimeoutMinutes: 60
+      #   llmRetryDelayMinutes: 5
+      #   llmRetryCount: 3
       #   defaultProvider: deepseek
       #   defaultModel: deepseek-chat

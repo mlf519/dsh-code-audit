@@ -18,13 +18,27 @@ export class AuditRunner {
     this.reportsDir = join(dataDir, 'reports')
     mkdirSync(this.trajectoryDir, { recursive: true })
     mkdirSync(this.reportsDir, { recursive: true })
-    /** runId -> { handle, sessionId, timeout, assistantText, summary, cancelRequested, progress, error } */
+    /** runId -> { handle, sessionId, assistantText, summary, cancelRequested, pauseRequested, progress, error } */
     this.active = new Map()
+    /** Paused runs keep their live session so they can continue from the interruption point. */
+    this.paused = new Map()
     /** Finished sessions kept alive so their conversation remains in the client sidebar. */
     this.retained = []
     this.maxRetained = Number(config.maxRetainedSessions) || 50
     /** sessionId -> runId */
     this.sessionRuns = new Map()
+    // Paused runs only live in memory. Records left over from a previous
+    // process can never be resumed, so close them instead of showing a stuck
+    // "已暂停" state.
+    for (const run of store.pausedRuns()) {
+      store.updateRun(run.id, {
+        status: 'cancelled',
+        finished_at: nowIso(),
+        error: '插件重启，暂停的会话已失效，请重新运行任务',
+      })
+      const task = store.getTask(run.task_id)
+      if (task && task.status === 'paused') store.updateTask(task.id, { status: 'cancelled' })
+    }
   }
 
   /** Live agent sessions visible to the developer; one at a time per run. */
@@ -33,6 +47,14 @@ export class AuditRunner {
       if (entry.taskId === taskId) return true
     }
     return false
+  }
+
+  /** The run of a task that is currently paused and can be continued. */
+  pausedRun(taskId) {
+    for (const [runId, entry] of this.paused) {
+      if (entry.taskId === taskId) return { runId, entry }
+    }
+    return null
   }
 
   limit() {
@@ -54,29 +76,6 @@ export class AuditRunner {
     return findDshSkillMirror(skill) ?? { name: result.name, dir: result.dir }
   }
 
-  /** (Re)arm the overall run timeout for a live agent. */
-  armTimeout(runId, handle) {
-    const entry = this.active.get(runId)
-    if (!entry) return
-    if (entry.timeout) {
-      clearTimeout(entry.timeout)
-      entry.timeout = null
-    }
-    const timeoutMinutes = Number(
-      this.store.getSetting('runTimeoutMinutes', this.config.runTimeoutMinutes ?? 60),
-    )
-    if (!TimeoutValid(timeoutMinutes)) return
-    entry.timeout = setTimeout(() => {
-      try {
-        handle.agent.cancel({ kind: 'user' })
-      } catch {
-        // ignore
-      }
-      this.finish(runId, { cancelled: true, error: `审计超时（${timeoutMinutes} 分钟）` })
-    }, timeoutMinutes * 60_000)
-    entry.timeout.unref?.()
-  }
-
   /** Wait for the agent to become idle, then either continue or finish. */
   watchIdle(runId) {
     const entry = this.active.get(runId)
@@ -95,6 +94,10 @@ export class AuditRunner {
   handleIdle(runId) {
     const entry = this.active.get(runId)
     if (!entry) return
+    if (entry.pauseRequested) {
+      this.finish(runId, { paused: true })
+      return
+    }
     if (entry.cancelRequested) {
       this.finish(runId, { cancelled: true })
       return
@@ -128,17 +131,12 @@ export class AuditRunner {
     entry.progress.note = `${delay > 0 ? `${delay} 分钟后` : '立即'}自动续跑（第 ${next}/${limit} 次）：${clip(error, 160)}`
     entry.progress.percent = Math.max(entry.progress.percent ?? 0, 10)
     this.persistProgress(runId)
-    // The overall timeout must not fire while we intentionally wait to resume.
-    if (entry.timeout) {
-      clearTimeout(entry.timeout)
-      entry.timeout = null
-    }
     entry.retryTimer = setTimeout(() => {
       const current = this.active.get(runId)
       if (!current) return
       current.retryTimer = null
-      if (current.cancelRequested) {
-        this.finish(runId, { cancelled: true })
+      if (current.pauseRequested || current.cancelRequested) {
+        this.finish(runId, current.pauseRequested ? { paused: true } : { cancelled: true })
         return
       }
       current.retries = next
@@ -159,7 +157,6 @@ export class AuditRunner {
         this.scheduleRetry(runId, current.error)
         return
       }
-      this.armTimeout(runId, current.handle)
       this.watchIdle(runId)
     }, delay * 60_000)
     entry.retryTimer.unref?.()
@@ -198,6 +195,8 @@ export class AuditRunner {
     if (!task.repo_path) throw new Error('审计任务缺少代码目录')
     if (this.isRunning(taskId)) throw new Error('该任务已有正在运行的审计')
     if (this.active.size >= this.limit()) throw new Error('已达到最大并发审计数，请稍后再试')
+    // Starting again after a pause begins a brand new conversation.
+    this.discardPaused(taskId)
 
     const auditMode = task.audit_mode === 'skill' ? 'skill' : 'prompts'
     const skill = auditMode === 'skill'
@@ -266,7 +265,7 @@ export class AuditRunner {
         assistantText: '',
         summary: '',
         cancelRequested: false,
-        timeout: null,
+        pauseRequested: false,
         retryTimer: null,
         retries: 0,
         createUserMessage,
@@ -304,13 +303,11 @@ export class AuditRunner {
       })
       handle.agent.followup(message)
 
-      this.armTimeout(run.id, handle)
       this.watchIdle(run.id)
     } catch (error) {
       // Drop any half-initialized entry so later runs are not blocked.
       const partial = this.active.get(run.id)
       if (partial) {
-        if (partial.timeout) clearTimeout(partial.timeout)
         if (partial.retryTimer) clearTimeout(partial.retryTimer)
         if (partial.progressTimer) clearTimeout(partial.progressTimer)
         this.active.delete(run.id)
@@ -346,11 +343,104 @@ export class AuditRunner {
     return this.store.getRun(run.id)
   }
 
+  /**
+   * Pause a live run: stop the current model reply but keep the session so the
+   * audit can continue from the interruption point later.
+   */
+  pause(runId) {
+    const entry = this.active.get(runId)
+    if (!entry) throw new Error('该运行已结束')
+    entry.pauseRequested = true
+    entry.cancelRequested = false
+    if (entry.retryTimer) {
+      clearTimeout(entry.retryTimer)
+      entry.retryTimer = null
+      this.finish(runId, { paused: true })
+      return
+    }
+    try {
+      entry.handle.agent.cancel({ kind: 'user' })
+    } catch {
+      // ignore
+    }
+  }
+
+  /** Continue a paused run from where it stopped, reusing the same session. */
+  resume(runId) {
+    const entry = this.paused.get(runId)
+    if (!entry) throw new Error('该运行不在暂停状态')
+    if (this.active.size >= this.limit()) throw new Error('已达到最大并发审计数，请稍后再试')
+    this.paused.delete(runId)
+    this.sessionRuns.set(entry.sessionId, runId)
+    this.active.set(runId, entry)
+    entry.pauseRequested = false
+    entry.cancelRequested = false
+    entry.error = null
+    entry.retries = 0
+    entry.progress.stage = '继续审计'
+    entry.progress.note = '已从暂停点继续'
+    entry.progress.updatedAt = nowIso()
+    this.store.updateRun(runId, { status: 'running', finished_at: null, error: null, progress: entry.progress })
+    this.store.updateTask(entry.taskId, { status: 'running' })
+    try {
+      entry.handle.agent.followup(entry.createUserMessage({
+        content: [{
+          type: 'text',
+          text: '继续。上一次审计被用户暂停，请从中断处继续完成剩余的审计工作，不要重复已经完成的部分。',
+        }],
+        source: { kind: 'user' },
+      }))
+    } catch (error) {
+      this.finish(runId, { error: String(error?.message ?? error) })
+      throw error
+    }
+    this.watchIdle(runId)
+    return this.store.getRun(runId)
+  }
+
+  /** Drop a paused run so a fresh start can create a new conversation. */
+  discardPaused(taskId) {
+    for (const [runId, entry] of [...this.paused]) {
+      if (entry.taskId !== taskId) continue
+      this.paused.delete(runId)
+      this.sessionRuns.delete(entry.sessionId)
+      try {
+        entry.handle.dispose()
+      } catch {
+        // ignore
+      }
+      this.store.updateRun(runId, {
+        status: 'cancelled',
+        finished_at: nowIso(),
+        error: '暂停后重新运行，已替换为新的审计会话',
+        progress: {
+          ...entry.progress,
+          stage: '已取消',
+          note: '暂停后重新运行，已替换为新的审计会话',
+          updatedAt: nowIso(),
+        },
+      })
+    }
+  }
+
   /** Cancel an active run. */
   cancel(runId) {
+    const paused = this.paused.get(runId)
+    if (paused) {
+      this.paused.delete(runId)
+      this.sessionRuns.delete(paused.sessionId)
+      try {
+        paused.handle.dispose()
+      } catch {
+        // ignore
+      }
+      this.finishPausedRecord(runId, paused, '运行已取消')
+      return
+    }
     const entry = this.active.get(runId)
     if (!entry) throw new Error('该运行已结束')
     entry.cancelRequested = true
+    entry.pauseRequested = false
     if (entry.retryTimer) {
       clearTimeout(entry.retryTimer)
       entry.retryTimer = null
@@ -555,12 +645,10 @@ export class AuditRunner {
     this.store.updateRun(context.runId, { summary: clip(summary, 4000) })
   }
 
-  finish(runId, { error, cancelled = false } = {}) {
+  finish(runId, { error, cancelled = false, paused = false } = {}) {
     const entry = this.active.get(runId)
     if (!entry) return
     this.active.delete(runId)
-    this.sessionRuns.delete(entry.sessionId)
-    if (entry.timeout) clearTimeout(entry.timeout)
     if (entry.retryTimer) clearTimeout(entry.retryTimer)
     if (entry.progressTimer) clearTimeout(entry.progressTimer)
 
@@ -568,19 +656,45 @@ export class AuditRunner {
     if (!run) return
     const findingsCount = this.store.countFindingsForRun(runId)
     const failure = error ?? entry.error
-    const status = cancelled || entry.cancelRequested ? 'cancelled' : failure ? 'failed' : 'completed'
+    const status = paused
+      ? 'paused'
+      : cancelled || entry.cancelRequested
+        ? 'cancelled'
+        : failure
+          ? 'failed'
+          : 'completed'
     const progress = {
       ...entry.progress,
       done: entry.donePrompts.length,
       findings: findingsCount,
       percent: status === 'completed' ? 100 : entry.progress.percent ?? 0,
-      stage: status === 'failed' ? '失败' : status === 'cancelled' ? '已取消' : '完成',
-      note: clip(failure || (status === 'cancelled' ? '运行已取消' : '审计完成'), 300),
+      stage: status === 'paused'
+        ? '已暂停'
+        : status === 'failed'
+          ? '失败'
+          : status === 'cancelled'
+            ? '已取消'
+            : '完成',
+      note: clip(
+        status === 'paused'
+          ? '已暂停，点击「继续」可从中断点继续审计'
+          : failure || (status === 'cancelled' ? '运行已取消' : '审计完成'),
+        300,
+      ),
       updatedAt: nowIso(),
     }
+
+    if (paused) {
+      entry.pauseRequested = false
+      entry.error = null
+      this.paused.set(runId, entry)
+    } else {
+      this.sessionRuns.delete(entry.sessionId)
+    }
+
     this.store.updateRun(runId, {
       status,
-      finished_at: nowIso(),
+      finished_at: paused ? null : nowIso(),
       findings_count: findingsCount,
       summary: clip(entry.summary || entry.assistantText, 4000),
       error: failure ? clip(failure, 1000) : null,
@@ -589,7 +703,9 @@ export class AuditRunner {
 
     const task = this.store.getTask(run.task_id)
     if (task) {
-      if (task.schedule_type !== 'manual' && task.enabled) {
+      if (paused) {
+        this.store.updateTask(task.id, { status: 'paused' })
+      } else if (task.schedule_type !== 'manual' && task.enabled) {
         const next = rescheduleAfterRun(task)
         this.store.updateTask(task.id, { ...next, status: next.next_run_at ? 'scheduled' : status })
       } else {
@@ -611,7 +727,25 @@ export class AuditRunner {
     }
 
     // Keep the conversation in the sidebar instead of disposing the session.
-    this.retainSession(entry, task, run)
+    if (!paused) this.retainSession(entry, task, run)
+  }
+
+  /** Close the record of a paused run that was cancelled instead of resumed. */
+  finishPausedRecord(runId, entry, note) {
+    this.store.updateRun(runId, {
+      status: 'cancelled',
+      finished_at: nowIso(),
+      error: note,
+      progress: {
+        ...entry.progress,
+        stage: '已取消',
+        note,
+        updatedAt: nowIso(),
+      },
+    })
+    const run = this.store.getRun(runId)
+    const task = run ? this.store.getTask(run.task_id) : null
+    if (task) this.store.updateTask(task.id, { status: 'cancelled', next_run_at: null })
   }
 
   /**
@@ -645,7 +779,6 @@ export class AuditRunner {
   /** Dispose every live agent; called on plugin unload. */
   dispose() {
     for (const [runId, entry] of this.active) {
-      if (entry.timeout) clearTimeout(entry.timeout)
       if (entry.retryTimer) clearTimeout(entry.retryTimer)
       if (entry.progressTimer) clearTimeout(entry.progressTimer)
       try {
@@ -665,6 +798,19 @@ export class AuditRunner {
       })
     }
     this.active.clear()
+    for (const [runId, entry] of this.paused) {
+      try {
+        entry.handle.dispose()
+      } catch {
+        // ignore
+      }
+      this.store.updateRun(runId, {
+        status: 'cancelled',
+        finished_at: nowIso(),
+        error: '插件已卸载，暂停的审计已终止',
+      })
+    }
+    this.paused.clear()
     for (const item of this.retained) {
       try {
         item.handle.dispose()
@@ -675,10 +821,6 @@ export class AuditRunner {
     this.retained = []
     this.sessionRuns.clear()
   }
-}
-
-function TimeoutValid(value) {
-  return Number.isFinite(value) && value > 0
 }
 
 /** Auto-continue delay in minutes, clamped to the 24h ceiling. */

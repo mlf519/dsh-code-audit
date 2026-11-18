@@ -116,11 +116,6 @@ async function handleApi(req, res, url, route, context) {
         if (!Number.isFinite(value) || value <= 0) throw httpError(400, '最大并发数必须为正整数')
         store.setSetting('maxConcurrentRuns', Math.floor(value))
       }
-      if (body.runTimeoutMinutes !== undefined) {
-        const value = Number(body.runTimeoutMinutes)
-        if (!Number.isFinite(value) || value < 0) throw httpError(400, '超时时间必须为非负数字')
-        store.setSetting('runTimeoutMinutes', Math.floor(value))
-      }
       if (body.llmRetryDelayMinutes !== undefined) {
         const value = Number(body.llmRetryDelayMinutes)
         if (!Number.isFinite(value) || value < 0 || value > 1440) throw httpError(400, '自动续跑间隔必须为 0–1440 分钟')
@@ -169,6 +164,7 @@ async function handleTasks(req, res, url, segments, context) {
   }
   if (method === 'DELETE' && segments.length === 2) {
     if (!store.getTask(id)) throw httpError(404, '审计任务不存在')
+    runner.discardPaused(id)
     store.deleteTask(id)
     sendJson(res, 200, { deleted: true })
     return
@@ -183,6 +179,20 @@ async function handleTasks(req, res, url, segments, context) {
     if (!running) throw httpError(400, '该任务没有正在进行的运行')
     runner.cancel(running.id)
     sendJson(res, 200, { cancelled: true })
+    return
+  }
+  if (method === 'POST' && action === 'pause') {
+    const running = store.activeRuns().find(run => run.task_id === id)
+    if (!running) throw httpError(400, '该任务没有正在进行的运行')
+    runner.pause(running.id)
+    sendJson(res, 200, { paused: true })
+    return
+  }
+  if (method === 'POST' && action === 'resume') {
+    const paused = runner.pausedRun(id)
+    if (!paused) throw httpError(400, '暂停的审计会话已失效，请点击「运行」重新开始')
+    const run = runner.resume(paused.runId)
+    sendJson(res, 200, { run })
     return
   }
   if (method === 'POST' && action === 'toggle') {
@@ -550,7 +560,9 @@ async function handleRuns(req, res, segments, context) {
   if (method === 'DELETE' && segments.length === 2) {
     const run = store.getRun(id)
     if (!run) throw httpError(404, '运行记录不存在')
-    if (run.status === 'running') throw httpError(409, '运行中的记录不能删除，请先取消运行')
+    if (run.status === 'running' || run.status === 'paused') {
+      throw httpError(409, '运行中的记录不能删除，请先取消运行')
+    }
     store.deleteRun(id)
     const trajectory = run.trajectory_path
     if (trajectory && resolve(trajectory).startsWith(resolve(dataDir) + sep)) {
@@ -566,6 +578,16 @@ async function handleRuns(req, res, segments, context) {
   if (method === 'POST' && action === 'cancel') {
     runner.cancel(id)
     sendJson(res, 200, { cancelled: true })
+    return
+  }
+  if (method === 'POST' && action === 'pause') {
+    runner.pause(id)
+    sendJson(res, 200, { paused: true })
+    return
+  }
+  if (method === 'POST' && action === 'resume') {
+    const run = runner.resume(id)
+    sendJson(res, 200, { run })
     return
   }
   throw httpError(404, '接口不存在')

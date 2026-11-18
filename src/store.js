@@ -407,7 +407,7 @@ export class AuditStore {
     return this.db
       .prepare(
         `SELECT * FROM tasks
-         WHERE enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ? AND status NOT IN ('running')
+         WHERE enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ? AND status NOT IN ('running', 'paused')
          ORDER BY next_run_at`,
       )
       .all(now)
@@ -443,6 +443,13 @@ export class AuditStore {
   activeRuns() {
     return this.db
       .prepare("SELECT * FROM runs WHERE status = 'running' ORDER BY started_at")
+      .all()
+      .map(row => this.mapRun(row))
+  }
+
+  pausedRuns() {
+    return this.db
+      .prepare("SELECT * FROM runs WHERE status = 'paused' ORDER BY started_at")
       .all()
       .map(row => this.mapRun(row))
   }

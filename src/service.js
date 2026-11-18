@@ -115,6 +115,7 @@ export function buildState(store, { dataDir, maxConcurrentRuns } = {}) {
       tasks: tasks.length,
       scheduled: tasks.filter(task => task.next_run_at && task.enabled).length,
       running: tasks.filter(task => task.status === 'running').length,
+      paused: tasks.filter(task => task.status === 'paused').length,
       findings: findings.length,
       openFindings: findings.filter(finding => finding.status === 'open').length,
       verifiedFindings: findings.filter(finding => finding.status === 'verified').length,
@@ -140,7 +141,6 @@ export function buildState(store, { dataDir, maxConcurrentRuns } = {}) {
     runs: runs.map(run => ({ ...runSummary(run), task_name: taskMap.get(run.task_id)?.name ?? '' })),
     settings: store.allSettings({
       maxConcurrentRuns,
-      runTimeoutMinutes: 60,
       defaultProvider: '',
       defaultModel: '',
     }),
