@@ -16,6 +16,10 @@ const state = {
   modalOpen: false,
   lastRender: 0,
   models: null,
+  sessions: [],
+  sessionCount: 0,
+  sessionView: 'active',
+  selectedSessions: new Set(),
 }
 
 const panel = () => document.getElementById('panel')
@@ -80,12 +84,22 @@ function progressHtml(run) {
     const elapsed = runElapsed(run)
     if (elapsed) parts.push(`已运行 ${elapsed}`)
     if (progress.prompt) parts.push(progress.prompt)
+    if (progress.retry) {
+      const digest = progress.retry
+      let at = ''
+      const when = digest.at ? new Date(digest.at) : null
+      if (when && !Number.isNaN(when.getTime())) {
+        const pad = value => String(value).padStart(2, '0')
+        at = `，${pad(when.getHours())}:${pad(when.getMinutes())} 继续`
+      }
+      parts.push(`等待自动续跑 ${digest.attempt ?? '?'}/${digest.limit ?? '?'}${at}`)
+    }
   }
   const indeterminate = percent === null && running
   const width = percent === null ? (running ? 35 : 0) : percent
   return `<div class="progress ${esc(run.status)}">
     <div class="progress-bar${indeterminate ? ' indeterminate' : ''}"><span style="width:${width}%"></span></div>
-    <div class="progress-meta">${esc(parts.join(' · ') || '—')}</div>
+    <div class="progress-meta">${running && progress.retry ? '<span class="badge medium">等待续跑</span> ' : ''}${esc(parts.join(' · ') || '—')}</div>
     ${progress.note ? `<div class="progress-note" title="${esc(progress.note)}">${esc(progress.note)}</div>` : ''}
   </div>`
 }
@@ -93,6 +107,8 @@ function progressHtml(run) {
 async function api(path, options = {}) {
   const response = await fetch(`${API}${path}`, {
     headers: { 'Content-Type': 'application/json' },
+    // Session/task listings change on every action; never serve a cached copy.
+    cache: 'no-store',
     ...options,
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
   })
@@ -329,6 +345,9 @@ function renderStats() {
 }
 
 function renderCounts() {
+  const sessionCount = document.getElementById('count-sessions')
+  if (sessionCount) sessionCount.textContent = state.sessionCount ?? state.sessions.length
+  if (!state.data) return
   document.getElementById('count-tasks').textContent = state.data.tasks.length
   document.getElementById('count-findings').textContent = state.data.findings.length
   document.getElementById('count-prompts').textContent = state.data.prompts.length
@@ -337,13 +356,14 @@ function renderCounts() {
 }
 
 function renderPanel() {
-  if (!state.data) return
+  if (!state.data && state.tab !== 'sessions') return
   const render = {
     tasks: renderTasks,
     findings: renderFindings,
     prompts: renderPrompts,
     skills: renderSkills,
     runs: renderRuns,
+    sessions: renderSessions,
     settings: renderSettings,
   }[state.tab]
   panel().innerHTML = render()
@@ -540,6 +560,90 @@ function renderRuns() {
       : `<div class="table-wrap"><table><thead><tr><th>运行</th><th>状态</th><th>进度</th><th>触发</th><th>开始</th><th>结束</th><th>漏洞</th><th>结论</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table></div>`}`
 }
 
+/** Populate the tab badge without switching or re-rendering the panel. */
+async function loadSessionCount() {
+  try {
+    const payload = await api('/sessions?view=active')
+    const sessions = Array.isArray(payload.sessions) ? payload.sessions : []
+    state.sessionCount = sessions.length
+    // Do not clobber the list if the user already switched to the archived view.
+    if (state.sessionView === 'active') state.sessions = sessions
+    renderCounts()
+  } catch {
+    // The tab still loads on demand when the endpoint is unavailable.
+  }
+}
+
+async function loadSessions(view = state.sessionView) {
+  try {
+    const payload = await api(`/sessions?view=${encodeURIComponent(view)}`)
+    state.sessionView = payload.view === 'archived' ? 'archived' : 'active'
+    state.sessions = Array.isArray(payload.sessions) ? payload.sessions : []
+    if (state.sessionView === 'active') state.sessionCount = state.sessions.length
+    state.selectedSessions.clear()
+    renderCounts()
+    renderPanel()
+    // The badge always reflects active sessions; refresh it after viewing or
+    // restoring from the archive.
+    if (state.sessionView === 'archived') loadSessionCount()
+  } catch (error) {
+    toast(error.message, true)
+  }
+}
+
+function renderSessions() {
+  const archived = state.sessionView === 'archived'
+  const sessions = state.sessions
+  const selected = state.selectedSessions
+  const rows = sessions.map(session => {
+    const tags = []
+    const locked = session.live || session.paused
+    if (session.live) tags.push(badge('verified', '运行中'))
+    if (session.paused) tags.push(badge('medium', '审计暂停中'))
+    if (session.archived) tags.push(badge('ignored', '已归档'))
+    return `<tr>
+      <td class="check-col"><input type="checkbox" data-action="session-toggle" data-id="${esc(session.id)}" ${selected.has(session.id) ? 'checked' : ''} ${locked ? 'disabled' : ''}></td>
+      <td class="title-cell">${esc(session.title || '（未命名会话）')}<small class="mono">${esc(session.id)}</small></td>
+      <td class="path">${esc(session.cwd || '—')}</td>
+      <td class="nowrap">${esc(fmtDate(session.createdAt ? new Date(session.createdAt).toISOString() : ''))}</td>
+      <td class="nowrap">${tags.join(' ') || '<span class="path">空闲</span>'}</td>
+      <td class="nowrap"><div class="btn-group">
+        ${locked
+          ? `<button class="btn small" type="button" disabled>${session.live ? '运行中' : '审计暂停中'}</button>`
+          : archived
+            ? `<button class="btn small primary" data-action="session-restore" data-id="${esc(session.id)}">恢复</button><button class="btn small danger" data-action="session-delete" data-id="${esc(session.id)}">删除</button>`
+            : `<button class="btn small" data-action="session-archive" data-id="${esc(session.id)}">归档</button><button class="btn small danger" data-action="session-delete" data-id="${esc(session.id)}">删除</button>`}
+      </div></td>
+    </tr>`
+  }).join('')
+  const allChecked = sessions.length > 0 && sessions.every(session => selected.has(session.id) || session.live || session.paused)
+  const selectedCount = selected.size
+
+  return `
+    <div class="panel-head">
+      <div><h2>会话管理</h2><div class="sub">仅列出主会话；归档或删除主会话时，其全部子 agent 会话会一并处置（归档可恢复，删除不可撤销）。</div></div>
+      <div class="panel-actions">
+        <div class="segmented">
+          <button class="btn small ${archived ? '' : 'primary'}" data-action="sessions-view" data-view="active">活跃</button>
+          <button class="btn small ${archived ? 'primary' : ''}" data-action="sessions-view" data-view="archived">已归档</button>
+        </div>
+        <button class="btn small" data-action="sessions-refresh">刷新</button>
+      </div>
+    </div>
+    <div class="sessions-bar">
+      <label class="checkbox-line"><input type="checkbox" data-action="sessions-select-all" ${allChecked ? 'checked' : ''}> 全选</label>
+      <span class="path">已选 ${selectedCount} / ${sessions.length}</span>
+      <div class="btn-group">
+        ${archived
+          ? '<button class="btn small primary" data-action="sessions-restore" data-batch="1">批量恢复</button><button class="btn small danger" data-action="sessions-delete" data-batch="1">批量删除</button>'
+          : '<button class="btn small" data-action="sessions-archive" data-batch="1">批量归档</button><button class="btn small danger" data-action="sessions-delete" data-batch="1">批量删除</button>'}
+      </div>
+    </div>
+    ${sessions.length === 0
+      ? `<div class="empty"><strong>${archived ? '暂无归档会话' : '暂无会话'}</strong>${archived ? '归档后的会话会出现在这里，可随时恢复。' : 'DSH 产生的会话会自动显示在这里。'}</div>`
+      : `<div class="table-wrap"><table><thead><tr><th class="check-col"></th><th>会话</th><th>工作目录</th><th>创建时间</th><th>状态</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table></div>`}`
+}
+
 function renderSettings() {
   const settings = state.data.settings
   return `
@@ -552,6 +656,8 @@ function renderSettings() {
           <div class="field"><label>最大并发审计数</label><input type="number" min="1" step="1" name="maxConcurrentRuns" value="${esc(settings.maxConcurrentRuns ?? 1)}"></div>
           <div class="field"><label>模型回复失败后自动续跑间隔（分钟）</label><input type="number" min="0" max="1440" step="1" name="llmRetryDelayMinutes" value="${esc(settings.llmRetryDelayMinutes ?? 5)}"><div class="hint">回复超时/失败后等待多久自动发送「继续」，0 表示立即，最大 1440（24 小时）。</div></div>
           <div class="field"><label>自动续跑次数上限</label><input type="number" min="0" max="100" step="1" name="llmRetryCount" value="${esc(settings.llmRetryCount ?? 3)}"><div class="hint">达到次数仍未成功才判定任务失败；0 表示不自动续跑。</div></div>
+          <div class="field full"><label>子 agent 审计参数（仅漏洞提示词模式）</label><div class="hint">仅在提示词审计任务开启「多子 agent 审计」时生效；Skill 模式遵循 Skill 自身规则，不使用该参数。子 agent 失败由主对话负责重试一次，两次均失败则标记「审计失败」。</div></div>
+          <div class="field"><label>子 agent 并发上限</label><input type="number" min="1" max="20" step="1" name="subagentMaxConcurrent" value="${esc(settings.subagentMaxConcurrent ?? 3)}"><div class="hint">单个审计主对话同时运行的前台子 agent 数量，超出的子 agent 排队执行。</div></div>
           <div class="field"><label>默认模型服务商（可选）</label><input name="defaultProvider" placeholder="例如 deepseek" value="${esc(settings.defaultProvider ?? '')}"><div class="hint">留空使用 DSH 默认模型。</div></div>
           <div class="field"><label>默认模型（可选）</label><input name="defaultModel" placeholder="例如 deepseek-chat" value="${esc(settings.defaultModel ?? '')}"></div>
           <div class="full"><button class="btn primary" type="submit">保存设置</button></div>
@@ -606,6 +712,7 @@ function bindPanelExtras() {
             maxConcurrentRuns: Number(data.get('maxConcurrentRuns')),
             llmRetryDelayMinutes: Number(data.get('llmRetryDelayMinutes')),
             llmRetryCount: Number(data.get('llmRetryCount')),
+            subagentMaxConcurrent: Number(data.get('subagentMaxConcurrent')),
             defaultProvider: String(data.get('defaultProvider') ?? ''),
             defaultModel: String(data.get('defaultModel') ?? ''),
           },
@@ -669,6 +776,7 @@ async function openTaskModal(task) {
   const scheduleType = task?.schedule_type ?? 'manual'
   const auditMode = task?.audit_mode === 'skill' ? 'skill' : 'prompts'
   const skills = state.data.skills
+  const subagentAudit = task?.subagent_audit === true
   const currentSkillId = task?.skill_id ?? ''
   const enabledSkills = skills.filter(skill => skill.enabled)
   const currentSkillAvailable = enabledSkills.some(skill => skill.id === currentSkillId)
@@ -724,6 +832,15 @@ async function openTaskModal(task) {
         </div>
         <div class="prompt-list">${promptList}</div>
       </div>
+      <div class="field full" data-subagent-panel ${auditMode === 'skill' ? 'hidden' : ''}>
+        <label>多子 agent 审计</label>
+        <button type="button" class="switch" data-subagent-switch data-on="${subagentAudit ? '1' : '0'}" aria-pressed="${subagentAudit}">
+          <span class="switch-knob"></span>
+          <span class="switch-text switch-left">开启</span>
+          <span class="switch-text switch-right">关闭</span>
+        </button>
+        <div class="hint">开启后为每个勾选的漏洞类型单独创建前台子 agent 并行审计；子 agent 失败由主对话重试一次，两次均失败则在报告中标记「审计失败」。关闭时仅在主对话内审计。</div>
+      </div>
       <div class="field full" data-mode-panel="skill" ${auditMode === 'prompts' ? 'hidden' : ''}>
         <label>审计 Skill *</label>
         <select name="skill_id">
@@ -761,6 +878,10 @@ async function openTaskModal(task) {
       modal.querySelectorAll('.mode-option').forEach(node => {
         node.classList.toggle('active', node.dataset.mode === mode)
       })
+      // Sub-agent splitting only applies to prompt-mode audits; Skill mode
+      // keeps its own execution rules.
+      const subagentPanel = modal.querySelector('[data-subagent-panel]')
+      if (subagentPanel) subagentPanel.hidden = mode !== 'prompts'
       // Skill mode decides the whole audit scope, so vulnerability prompts are
       // not applicable and must not be selectable.
       const promptPanel = modal.querySelector('[data-mode-panel="prompts"]')
@@ -787,6 +908,13 @@ async function openTaskModal(task) {
     }
     modal.querySelector('[data-prompt-all]')?.addEventListener('click', () => setAllPrompts(true))
     modal.querySelector('[data-prompt-none]')?.addEventListener('click', () => setAllPrompts(false))
+
+    const subagentSwitch = modal.querySelector('[data-subagent-switch]')
+    subagentSwitch?.addEventListener('click', () => {
+      const next = subagentSwitch.dataset.on !== '1'
+      subagentSwitch.dataset.on = next ? '1' : '0'
+      subagentSwitch.setAttribute('aria-pressed', String(next))
+    })
 
     const repoInput = form.querySelector('[name="repo_path"]')
     const providerSelect = form.querySelector('#task-provider')
@@ -822,6 +950,7 @@ async function openTaskModal(task) {
         audit_mode: mode,
         skill_id: mode === 'skill' ? skillId : '',
         prompt_ids: promptIds,
+        subagent_audit: mode === 'prompts' && form.querySelector('[data-subagent-switch]')?.dataset.on === '1',
         schedule_type: scheduleType,
         enabled: data.get('enabled') === 'on',
         provider: String(data.get('provider') ?? ''),
@@ -1235,6 +1364,42 @@ async function handleAction(action, target) {
   }
   if (action === 'finding-detail' && finding) return openFindingModal(finding)
 
+  if (action === 'sessions-refresh') return loadSessions()
+  if (action === 'sessions-view') return loadSessions(target.dataset.view)
+  if (action === 'session-toggle') {
+    if (target.checked) state.selectedSessions.add(id)
+    else state.selectedSessions.delete(id)
+    renderPanel()
+    return
+  }
+  if (action === 'sessions-select-all') {
+    state.selectedSessions.clear()
+    if (target.checked) {
+      for (const session of state.sessions) {
+        if (!session.live && !session.paused) state.selectedSessions.add(session.id)
+      }
+    }
+    renderPanel()
+    return
+  }
+  if (['session-archive', 'sessions-archive', 'session-restore', 'sessions-restore', 'session-delete', 'sessions-delete'].includes(action)) {
+    const ids = id ? [id] : [...state.selectedSessions]
+    if (ids.length === 0) return toast('请先选择会话', true)
+    const verb = action.includes('archive') ? 'archive' : action.includes('restore') ? 'restore' : 'delete'
+    const label = verb === 'archive' ? '归档' : verb === 'restore' ? '恢复' : '删除'
+    if (verb === 'delete' && !confirm(`确定删除选中的 ${ids.length} 个会话？删除后不可恢复。`)) return
+    try {
+      const payload = await api(`/sessions/${verb}`, { method: 'POST', body: { ids } })
+      const failed = (payload.results ?? []).filter(row => !row.ok)
+      if (failed.length) toast(`${failed.length} 个会话${label}失败：${failed[0].error}`, true)
+      else toast(`已${label} ${ids.length} 个会话`)
+      await loadSessions()
+    } catch (error) {
+      toast(error.message, true)
+    }
+    return
+  }
+
   if (action === 'run-task' && task) {
     target.disabled = true
     try {
@@ -1428,12 +1593,15 @@ function bindEvents() {
     state.tab = tab.dataset.tab
     document.querySelectorAll('.tab').forEach(node => node.classList.toggle('active', node === tab))
     renderPanel()
+    if (state.tab === 'sessions') loadSessions()
   })
 
   panel().addEventListener('click', event => {
     const target = event.target.closest('[data-action]')
     if (!target) return
-    event.preventDefault()
+    // Let checkbox/radio default behavior update .checked before the handler reads it.
+    const isCheckable = target.tagName === 'INPUT' && (target.type === 'checkbox' || target.type === 'radio')
+    if (!isCheckable) event.preventDefault()
     handleAction(target.dataset.action, target).catch(error => toast(error.message, true))
   })
 
@@ -1454,5 +1622,5 @@ async function poll() {
 }
 
 bindEvents()
-load()
+load().then(loadSessionCount)
 setInterval(poll, 4000)

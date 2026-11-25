@@ -6,6 +6,12 @@ import { findDshSkillMirror, invalidateDshSkills, syncSkillToDsh } from './dshsk
 import { skillPromptContent } from './skillpack.js'
 import { clip, nowIso } from './util.js'
 
+/** Normalize prompt names so spacing and punctuation differences still match. */
+const normalizePromptName = value => String(value ?? '')
+  .replace(/\s+/g, '')
+  .replace(/[（）()【】[\]：:·、,，.。\-_/]/g, '')
+  .toLowerCase()
+
 /** Drives audit runs by creating isolated DSH agent sessions. */
 export class AuditRunner {
   constructor({ ctx, store, dataDir, config = {}, resolveDefaultModel }) {
@@ -27,6 +33,8 @@ export class AuditRunner {
     this.maxRetained = Number(config.maxRetainedSessions) || 50
     /** sessionId -> runId */
     this.sessionRuns = new Map()
+    /** child sessionId -> runId, so child events count towards the parent run. */
+    this.childRuns = new Map()
     // Paused runs only live in memory. Records left over from a previous
     // process can never be resumed, so close them instead of showing a stuck
     // "已暂停" state.
@@ -57,9 +65,27 @@ export class AuditRunner {
     return null
   }
 
+  /** Sessions of paused runs: their files must stay put so resume can work. */
+  protectedSessionIds() {
+    const ids = new Set()
+    for (const entry of this.paused.values()) {
+      if (entry.sessionId) ids.add(entry.sessionId)
+    }
+    return ids
+  }
+
   limit() {
     const configured = Number(this.store.getSetting('maxConcurrentRuns', this.config.maxConcurrentRuns ?? 1))
     return Number.isFinite(configured) && configured > 0 ? Math.floor(configured) : 1
+  }
+
+  /** Concurrency limit shared by prompt-mode sub-agent audits. */
+  subagentConfig() {
+    return {
+      maxConcurrent: Concurrency(
+        this.store.getSetting('subagentMaxConcurrent', this.config.subagentMaxConcurrent ?? 3),
+      ),
+    }
   }
 
   /**
@@ -102,11 +128,297 @@ export class AuditRunner {
       this.finish(runId, { cancelled: true })
       return
     }
+    // The parent turn can end while child audit sessions are still working.
+    // Keep the run alive until every child has ended.
+    if (entry.subagentAudit && this.hasPendingChildren(entry)) {
+      entry.idleWaiting = true
+      entry.progress.stage = '等待子 agent'
+      entry.progress.note = this.pendingChildrenNote(entry)
+      this.persistProgress(runId)
+      this.startChildPoll(runId)
+      return
+    }
+    // The parent went idle while some types were never dispatched (for example
+    // it stopped after the first batch). Nudge it to create the next batch
+    // instead of ending the audit with unfinished types.
+    if (!entry.error && entry.subagentAudit && this.remainingTypes(entry).length) {
+      if (this.nudgeNextBatch(runId, entry)) return
+    }
     if (!entry.error) {
       this.finish(runId)
       return
     }
     this.scheduleRetry(runId, entry.error)
+  }
+
+  /** Type names that are neither finished nor marked as failed. */
+  remainingTypes(entry) {
+    const names = []
+    for (const [name, type] of entry.typeStates ?? []) {
+      if (type.status !== 'done' && !type.final) names.push(name)
+    }
+    return names
+  }
+
+  /**
+   * Ask the idle parent to launch the still-missing sub-agents. After a few
+   * reminders the remaining types are marked failed so the run can end.
+   */
+  nudgeNextBatch(runId, entry) {
+    const remaining = this.remainingTypes(entry)
+    if (!remaining.length) return false
+    if ((entry.nudges ?? 0) >= 3) {
+      for (const name of remaining) {
+        const type = entry.typeStates?.get(name)
+        if (!type) continue
+        type.status = 'failed'
+        type.final = true
+        type.note = '主对话未继续创建子 agent'
+      }
+      entry.progress.stage = '审计失败'
+      entry.progress.note = `主对话未继续创建子 agent：${remaining.join('、')}`
+      this.syncTypes(entry)
+      this.persistProgress(runId)
+      this.finish(runId)
+      return true
+    }
+    entry.nudges = (entry.nudges ?? 0) + 1
+    const limit = entry.subagentConfig?.maxConcurrent ?? 3
+    entry.progress.stage = '继续派发子 agent'
+    entry.progress.note = `等待主对话创建剩余类型：${remaining.join('、')}`
+    this.persistProgress(runId)
+    try {
+      entry.handle.agent.followup(entry.createUserMessage({
+        content: [{
+          type: 'text',
+          text: `继续审计：以下漏洞类型尚未完成：${remaining.join('、')}。请立即按并发上限 ${limit} 创建这些类型的子 agent（不要重复已完成的类型），全部结束后再调用 code_audit_submit_summary。`,
+        }],
+        source: { kind: 'user' },
+      }))
+    } catch (error) {
+      entry.error = String(error?.message ?? error)
+      this.handleIdle(runId)
+      return true
+    }
+    this.watchIdle(runId)
+    return true
+  }
+
+  /** True while any child audit session is still running. */
+  hasPendingChildren(entry) {
+    if (!entry.subagentAudit) return false
+    for (const child of entry.children?.values() ?? []) {
+      if (child.status === 'running') return true
+    }
+    return false
+  }
+
+  pendingChildrenNote(entry) {
+    const running = this.countChildren(entry, 'running')
+    return running ? `主对话已空闲，${running} 个子 agent 正在审计` : '主对话已空闲，等待子 agent 结束'
+  }
+
+  countChildren(entry, status) {
+    let count = 0
+    for (const child of entry.children?.values() ?? []) {
+      if (child.status === status) count += 1
+    }
+    return count
+  }
+
+  /** Recompute the child counters stored on the run progress. */
+  recountSubagents(entry) {
+    if (!entry.children) return
+    const stats = {
+      total: entry.children.size,
+      running: 0,
+      done: 0,
+      failed: 0,
+      queued: 0,
+      limit: entry.subagentConfig?.maxConcurrent ?? 0,
+    }
+    for (const child of entry.children.values()) {
+      if (child.status === 'running') stats.running += 1
+      else if (child.failed) stats.failed += 1
+      else stats.done += 1
+    }
+    for (const type of entry.typeStates?.values() ?? []) {
+      if (type.status === 'pending') stats.queued += 1
+    }
+    entry.progress.subagents = stats
+  }
+
+  /** Poll the DSH sub-agent service as a fallback for missed lifecycle events. */
+  startChildPoll(runId) {
+    const entry = this.active.get(runId)
+    if (!entry || entry.childPoll) return
+    entry.childPoll = setInterval(() => {
+      this.syncChildren(runId).catch(() => {})
+    }, 10_000)
+    entry.childPoll.unref?.()
+  }
+
+  async syncChildren(runId) {
+    const entry = this.active.get(runId)
+    if (!entry) return
+    let children = null
+    try {
+      children = await this.ctx.subagents?.listChildren?.(entry.sessionId)
+    } catch {
+      children = null
+    }
+    if (Array.isArray(children)) {
+      const running = new Set(
+        children
+          .filter(child => child?.kind === 'child' && child?.activity === 'running')
+          .map(child => String(child.id ?? ''))
+          .filter(Boolean),
+      )
+      for (const [childId, child] of entry.children) {
+        if (child.status === 'running' && !running.has(childId)) {
+          child.status = 'ended'
+          this.childRuns.delete(childId)
+        }
+      }
+      for (const childId of running) {
+        if (entry.children.has(childId)) continue
+        entry.children.set(childId, { status: 'running', failed: false, startedAt: nowIso() })
+        this.childRuns.set(childId, runId)
+      }
+      this.recountSubagents(entry)
+      this.touchProgress(runId)
+    }
+    // Only re-check when the parent was already idle; otherwise this would
+    // finish a run whose parent is still working.
+    if (entry.idleWaiting && !this.hasPendingChildren(entry)) this.recheckIdle(runId)
+  }
+
+  recheckIdle(runId) {
+    const entry = this.active.get(runId)
+    if (!entry) return
+    if (entry.childPoll) {
+      clearInterval(entry.childPoll)
+      entry.childPoll = null
+    }
+    entry.idleWaiting = false
+    this.handleIdle(runId)
+  }
+
+  /** The run whose parent session is this agent. */
+  runIdForParent(parent) {
+    const sessionId = parent?.session?.id ?? parent?.id
+    if (!sessionId) return undefined
+    return this.sessionRuns.get(sessionId) ?? this.childRuns.get(sessionId)
+  }
+
+  /** Track a child audit session started by the parent audit agent. */
+  onSubagentStart(info, parent) {
+    const runId = this.runIdForParent(parent)
+    if (!runId) return
+    const entry = this.active.get(runId)
+    const childId = String(info?.id ?? '')
+    if (!entry || !childId) return
+    if (!entry.children.has(childId)) {
+      entry.children.set(childId, { status: 'running', failed: false, startedAt: nowIso() })
+    }
+    this.childRuns.set(childId, runId)
+    this.recountSubagents(entry)
+    if (entry.subagentAudit) {
+      entry.progress.stage = '子 agent 审计'
+      entry.progress.note = `${this.countChildren(entry, 'running')} 个子 agent 正在审计`
+    }
+    this.touchProgress(runId)
+  }
+
+  /** A child audit session ended; the run may now be ready to finish. */
+  onSubagentEnd(info, parent) {
+    const childId = String(info?.id ?? '')
+    const runId = this.runIdForParent(parent) ?? this.childRuns.get(childId)
+    if (!runId) return
+    const entry = this.active.get(runId)
+    this.childRuns.delete(childId)
+    if (entry && childId) {
+      const child = entry.children.get(childId) ?? { startedAt: nowIso() }
+      child.status = 'ended'
+      child.failed = isSubagentFailure(info)
+      entry.children.set(childId, child)
+      this.recountSubagents(entry)
+      if (entry.subagentAudit) {
+        entry.progress.note = child.failed
+          ? '子 agent 失败结束，等待主对话处理'
+          : `子 agent 完成，剩余 ${this.countChildren(entry, 'running')} 个`
+      }
+      this.touchProgress(runId)
+      if (entry.idleWaiting && !this.hasPendingChildren(entry)) this.recheckIdle(runId)
+    }
+  }
+
+  /** Best-effort cancel of the child sessions of a run. */
+  cancelChildren(entry) {
+    if (!entry.children) return
+    const parentAgent = entry.handle?.agent
+    let registry
+    try {
+      registry = this.ctx.get?.('agents') ?? this.ctx.agents
+    } catch {
+      registry = null
+    }
+    for (const childId of entry.children.keys()) {
+      let cancelled = false
+      // One-shot and continuable children are both live agents, so cancelling
+      // through the registry stops their current turn immediately.
+      try {
+        const agent = registry?.get?.(childId)
+        if (agent?.cancel) {
+          agent.cancel({ kind: 'parent' })
+          cancelled = true
+        }
+      } catch {
+        cancelled = false
+      }
+      if (!cancelled) {
+        try {
+          this.ctx.subagents?.interrupt?.(childId, parentAgent
+            ? { kind: 'ancestor', agent: parentAgent }
+            : { kind: 'user', parentSessionId: entry.sessionId })
+        } catch {
+          // Child may already be gone; nothing left to cancel.
+        }
+      }
+      const child = entry.children.get(childId)
+      if (child) {
+        child.status = 'cancelled'
+        child.failed = true
+      }
+      this.childRuns.delete(childId)
+    }
+    if (entry.subagentAudit) this.recountSubagents(entry)
+  }
+
+  /** Clear every timer a run owns, used when pausing/cancelling/finishing. */
+  clearRunTimers(entry) {
+    if (entry.childPoll) {
+      clearInterval(entry.childPoll)
+      entry.childPoll = null
+    }
+    if (entry.finishTimer) {
+      clearTimeout(entry.finishTimer)
+      entry.finishTimer = null
+    }
+  }
+
+  /**
+   * A wedged agent may never emit idle after cancel/pause, which left the run
+   * "running" forever. Force-finalize it if the normal idle path is too slow.
+   */
+  scheduleForceFinish(entry, runId, options, delayMs = 5000) {
+    if (entry.finishTimer) clearTimeout(entry.finishTimer)
+    entry.finishTimer = setTimeout(() => {
+      entry.finishTimer = null
+      if (this.active.get(runId) !== entry) return
+      this.finish(runId, options)
+    }, delayMs)
+    entry.finishTimer.unref?.()
   }
 
   /**
@@ -127,8 +439,10 @@ export class AuditRunner {
     )
     const next = entry.retries + 1
     entry.error = null
+    const retryAt = new Date(Date.now() + delay * 60_000).toISOString()
     entry.progress.stage = '等待续跑'
     entry.progress.note = `${delay > 0 ? `${delay} 分钟后` : '立即'}自动续跑（第 ${next}/${limit} 次）：${clip(error, 160)}`
+    entry.progress.retry = { attempt: next, limit, at: retryAt, reason: clip(error, 200) }
     entry.progress.percent = Math.max(entry.progress.percent ?? 0, 10)
     this.persistProgress(runId)
     entry.retryTimer = setTimeout(() => {
@@ -141,6 +455,7 @@ export class AuditRunner {
       }
       current.retries = next
       current.error = null
+      current.progress.retry = null
       current.progress.stage = '继续审计'
       current.progress.note = `自动续跑第 ${next}/${limit} 次（上次失败：${clip(error, 120)}）`
       this.persistProgress(runId)
@@ -148,7 +463,7 @@ export class AuditRunner {
         current.handle.agent.followup(current.createUserMessage({
           content: [{
             type: 'text',
-            text: '继续。上一次模型回复失败或中断，请从中断处继续完成审计任务，不要重复已经完成的工作。',
+            text: this.retryMessage(runId, current),
           }],
           source: { kind: 'user' },
         }))
@@ -163,9 +478,31 @@ export class AuditRunner {
   }
 
   /**
-   * Resolve provider/model for a run: the task selection wins, then the plugin
-   * default, then the DSH default model used by normal client sessions.
+   * Build the "continue" message after the main conversation failed. In
+   * sub-agent mode every unfinished type is re-queued: the restarted main
+   * conversation relaunches those sub-agents. Types already reported as
+   * failed stay failed and are not retried.
    */
+  retryMessage(runId, entry) {
+    const base = '继续。上一次模型回复失败或中断，请从中断处继续完成审计任务，不要重复已经完成的工作。'
+    if (!entry.subagentAudit || !entry.typeStates) return base
+    const pending = []
+    entry.nudges = 0
+    for (const [name, type] of entry.typeStates) {
+      if (type.status === 'done' || type.final) continue
+      type.status = 'pending'
+      type.note = ''
+      pending.push(name)
+    }
+    this.syncTypes(entry)
+    this.persistProgress(runId)
+    if (pending.length === 0) return base
+    return `${base}
+
+主对话已重启，请重新为以下所有未完成类型创建前台子 agent 继续审计：${pending.join('、')}。已标记「审计失败」的类型不再重试。`
+  }
+
+
   resolveSelection(task) {
     let preset = {}
     try {
@@ -213,6 +550,10 @@ export class AuditRunner {
     }
     const auditUnits = auditMode === 'skill' ? 1 : selectedPrompts.length
     const unitNames = auditMode === 'skill' ? [skill.name] : selectedPrompts.map(prompt => prompt.name)
+    // Sub-agent audits are a prompt-mode capability only; a Skill decides on
+    // its own whether to delegate work.
+    const subagentAudit = auditMode === 'prompts' && Boolean(task.subagent_audit)
+    const subagentConfig = this.subagentConfig()
 
     const selection = this.resolveSelection(task)
     if (!selection.provider || !selection.model) {
@@ -267,6 +608,8 @@ export class AuditRunner {
         cancelRequested: false,
         pauseRequested: false,
         retryTimer: null,
+        finishTimer: null,
+        nudges: 0,
         retries: 0,
         createUserMessage,
         error: null,
@@ -274,6 +617,14 @@ export class AuditRunner {
         promptNames: unitNames,
         donePrompts: [],
         auditMode,
+        subagentAudit,
+        subagentConfig,
+        children: new Map(),
+        typeStates: subagentAudit
+          ? new Map(unitNames.map(name => [name, { name, status: 'pending', final: false, note: '' }]))
+          : null,
+        childPoll: null,
+        idleWaiting: false,
         progress: {
           percent: 5,
           stage: '初始化',
@@ -284,6 +635,17 @@ export class AuditRunner {
           steps: 0,
           toolCalls: 0,
           findings: 0,
+          types: subagentAudit
+            ? unitNames.map(name => ({ name, status: 'pending', note: '' }))
+            : [],
+          subagents: {
+            total: 0,
+            running: 0,
+            done: 0,
+            failed: 0,
+            queued: subagentAudit ? auditUnits : 0,
+            limit: subagentConfig.maxConcurrent,
+          },
           updatedAt: nowIso(),
         },
       })
@@ -297,7 +659,9 @@ export class AuditRunner {
       const message = createUserMessage({
         content: [{
           type: 'text',
-          text: auditMode === 'skill' ? buildSkillAuditPrompt(task, skill, skillMirror) : buildAuditPrompt(task, selectedPrompts),
+          text: auditMode === 'skill'
+            ? buildSkillAuditPrompt(task, skill, skillMirror)
+            : buildAuditPrompt(task, selectedPrompts, { subagentAudit, subagentConfig }),
         }],
         source: { kind: 'user' },
       })
@@ -349,9 +713,20 @@ export class AuditRunner {
    */
   pause(runId) {
     const entry = this.active.get(runId)
-    if (!entry) throw new Error('该运行已结束')
+    if (!entry) {
+      this.finalizeOrphanRun(runId, {
+        status: 'paused',
+        note: '审计会话已失效，请点击「运行」重新开始',
+      })
+      return
+    }
     entry.pauseRequested = true
     entry.cancelRequested = false
+    // Drop the "waiting for sub-agents" flag so a later resume cannot be
+    // woken by a stale child-end event while the parent is still working.
+    entry.idleWaiting = false
+    this.clearRunTimers(entry)
+    this.cancelChildren(entry)
     if (entry.retryTimer) {
       clearTimeout(entry.retryTimer)
       entry.retryTimer = null
@@ -363,6 +738,7 @@ export class AuditRunner {
     } catch {
       // ignore
     }
+    this.scheduleForceFinish(entry, runId, { paused: true }, 8000)
   }
 
   /** Continue a paused run from where it stopped, reusing the same session. */
@@ -377,23 +753,28 @@ export class AuditRunner {
     entry.cancelRequested = false
     entry.error = null
     entry.retries = 0
+    entry.idleWaiting = false
+    entry.nudges = 0
+    entry.progress.retry = null
     entry.progress.stage = '继续审计'
     entry.progress.note = '已从暂停点继续'
     entry.progress.updatedAt = nowIso()
     this.store.updateRun(runId, { status: 'running', finished_at: null, error: null, progress: entry.progress })
     this.store.updateTask(entry.taskId, { status: 'running' })
+    const remaining = entry.subagentAudit ? this.remainingTypes(entry) : []
+    const resumeText = `继续。上一次审计被用户暂停，请从中断处继续完成剩余的审计工作，不要重复已经完成的部分。${
+      remaining.length ? `以下类型尚未完成，请为它们重新创建子 agent：${remaining.join('、')}。` : ''
+    }`
     try {
       entry.handle.agent.followup(entry.createUserMessage({
-        content: [{
-          type: 'text',
-          text: '继续。上一次审计被用户暂停，请从中断处继续完成剩余的审计工作，不要重复已经完成的部分。',
-        }],
+        content: [{ type: 'text', text: resumeText }],
         source: { kind: 'user' },
       }))
     } catch (error) {
       this.finish(runId, { error: String(error?.message ?? error) })
       throw error
     }
+    if (entry.subagentAudit && this.hasPendingChildren(entry)) this.startChildPoll(runId)
     this.watchIdle(runId)
     return this.store.getRun(runId)
   }
@@ -404,6 +785,8 @@ export class AuditRunner {
       if (entry.taskId !== taskId) continue
       this.paused.delete(runId)
       this.sessionRuns.delete(entry.sessionId)
+      this.clearRunTimers(entry)
+      this.cancelChildren(entry)
       try {
         entry.handle.dispose()
       } catch {
@@ -429,6 +812,8 @@ export class AuditRunner {
     if (paused) {
       this.paused.delete(runId)
       this.sessionRuns.delete(paused.sessionId)
+      this.clearRunTimers(paused)
+      this.cancelChildren(paused)
       try {
         paused.handle.dispose()
       } catch {
@@ -438,9 +823,16 @@ export class AuditRunner {
       return
     }
     const entry = this.active.get(runId)
-    if (!entry) throw new Error('该运行已结束')
+    if (!entry) {
+      // The plugin may have restarted while the record stayed "running"; the
+      // session behind it no longer exists, so finalize the record directly.
+      this.finalizeOrphanRun(runId, { status: 'cancelled', note: '运行已取消' })
+      return
+    }
     entry.cancelRequested = true
     entry.pauseRequested = false
+    this.clearRunTimers(entry)
+    this.cancelChildren(entry)
     if (entry.retryTimer) {
       clearTimeout(entry.retryTimer)
       entry.retryTimer = null
@@ -452,12 +844,16 @@ export class AuditRunner {
     } catch {
       // ignore
     }
+    this.scheduleForceFinish(entry, runId, { cancelled: true })
   }
 
   /** Record one session event into the run's trajectory JSONL. */
   onSessionEvent(session, event) {
-    const runId = this.sessionRuns.get(session.id)
+    const parentRunId = this.sessionRuns.get(session.id)
+    const childRunId = parentRunId ? undefined : this.childRuns.get(session.id)
+    const runId = parentRunId ?? childRunId
     if (!runId) return
+    const isChild = !parentRunId
     const entry = this.active.get(runId)
     if (!entry) return
     const run = this.store.getRun(runId)
@@ -465,12 +861,12 @@ export class AuditRunner {
     try {
       appendFileSync(
         run.trajectory_path,
-        `${JSON.stringify({ sessionId: session.id, seq: event.seq, time: event.time, type: event.type, data: event.data })}\n`,
+        `${JSON.stringify({ sessionId: session.id, child: isChild || undefined, seq: event.seq, time: event.time, type: event.type, data: event.data })}\n`,
       )
     } catch {
       // ignore
     }
-    if (event.type === 'assistant/message') {
+    if (!isChild && event.type === 'assistant/message') {
       const text = extractMessageText(event.data?.message)
       if (text) entry.assistantText = text
     } else if (event.type === 'tool/call') {
@@ -478,13 +874,13 @@ export class AuditRunner {
       this.touchProgress(runId)
     } else if (event.type === 'step/end') {
       entry.progress.steps += 1
-      if (entry.progress.stage === '初始化') {
+      if (!isChild && entry.progress.stage === '初始化') {
         entry.progress.stage = '代码探索'
         entry.progress.note = 'Agent 正在读取代码'
         entry.progress.percent = Math.max(entry.progress.percent ?? 0, 8)
       }
       this.touchProgress(runId)
-    } else if (event.type === 'turn/end') {
+    } else if (!isChild && event.type === 'turn/end') {
       const reason = event.data?.reason
       if (reason?.kind === 'error') {
         const message = String(reason.error?.message ?? 'Agent 运行失败').trim()
@@ -527,25 +923,58 @@ export class AuditRunner {
     if (!entry) throw new Error('当前没有正在运行的审计')
     const progress = entry.progress
     const rawName = String(input.prompt_name ?? '').trim()
-    const matched = entry.promptNames.find(
-      name => name === rawName || (rawName && (name.includes(rawName) || rawName.includes(name))),
-    )
+    const normalizedRaw = normalizePromptName(rawName)
+    // Exact match first, then a normalized comparison. The containment
+    // fallback picks the longest candidate so "SQL 注入" never shadows
+    // "SQL 注入（盲注）".
+    const matched = entry.promptNames.find(name => name === rawName) ??
+      (normalizedRaw
+        ? entry.promptNames.find(name => normalizePromptName(name) === normalizedRaw)
+        : undefined) ??
+      entry.promptNames
+        .filter(name => {
+          if (!normalizedRaw) return false
+          const normalized = normalizePromptName(name)
+          return normalized.includes(normalizedRaw) || normalizedRaw.includes(normalized)
+        })
+        .sort((a, b) => normalizePromptName(b).length - normalizePromptName(a).length)[0]
     const label = matched || rawName
+    const type = matched && entry.typeStates ? entry.typeStates.get(matched) : undefined
+    const status = input.status === 'done' ? 'done' : input.status === 'failed' ? 'failed' : 'started'
 
-    if (input.status === 'done') {
+    if (status === 'done') {
       if (matched && !entry.donePrompts.includes(matched)) entry.donePrompts.push(matched)
-      progress.done = entry.donePrompts.length
+      if (type) {
+        type.status = 'done'
+        type.note = clip(input.note, 200)
+      }
+      this.syncTypes(entry)
       progress.percent = Math.min(95, 10 + Math.round((progress.done / Math.max(progress.total, 1)) * 80))
       progress.stage = progress.done >= progress.total ? '汇总' : '类型审计'
       progress.prompt = progress.done >= progress.total ? '' : label
       progress.note = clip(input.note, 200) ||
         (progress.done >= progress.total ? '全部类型审计完成，正在生成总结' : `已完成：${label}`)
+    } else if (status === 'failed') {
+      if (type) {
+        // The main conversation retries a failed sub-agent once on its own;
+        // reporting `failed` means both attempts failed, so the type is final.
+        type.status = 'failed'
+        type.final = true
+        type.note = clip(input.note, 200) || '两次子 agent 审计均失败'
+      }
+      progress.stage = '类型审计失败'
+      progress.prompt = label
+      progress.note = clip(input.note, 200) || `审计失败：${label}`
+      this.syncTypes(entry)
+      if (entry.idleWaiting && !this.hasPendingChildren(entry)) this.recheckIdle(context.runId)
     } else {
+      if (type && !type.final) type.status = 'running'
       progress.stage = '类型审计'
       progress.prompt = label
       progress.note = clip(input.note, 200) || `正在审计：${label}`
       const base = 10 + Math.round((progress.done / Math.max(progress.total, 1)) * 80)
       progress.percent = Math.max(progress.percent ?? 0, Math.min(90, base))
+      this.syncTypes(entry)
     }
 
     this.persistProgress(context.runId)
@@ -555,7 +984,33 @@ export class AuditRunner {
       total: progress.total,
       stage: progress.stage,
       note: progress.note,
+      types: progress.types ?? [],
+      subagents: progress.subagents ?? null,
+      matched: matched ?? null,
+      warning: matched ? null : `未匹配到任务中的类型，可用名称：${entry.promptNames.join('、')}`,
     }
+  }
+
+  /** Mirror the type state machine into the persisted progress payload. */
+  syncTypes(entry) {
+    if (!entry.typeStates) return
+    const progress = entry.progress
+    const values = [...entry.typeStates.values()]
+    if (entry.subagentAudit) {
+      progress.types = values.map(item => ({
+        name: item.name,
+        status: item.status,
+        note: item.note,
+        final: Boolean(item.final),
+      }))
+    }
+    // Types marked as failed after both attempts count as finished work.
+    progress.done = Math.max(
+      entry.donePrompts.length,
+      values.filter(item => item.status === 'done' || item.final).length,
+    )
+    progress.failedTypes = values.filter(item => item.final).map(item => item.name)
+    this.recountSubagents(entry)
   }
 
   /** The active run for an agent (used by the submit tools). */
@@ -649,8 +1104,11 @@ export class AuditRunner {
     const entry = this.active.get(runId)
     if (!entry) return
     this.active.delete(runId)
+    entry.idleWaiting = false
     if (entry.retryTimer) clearTimeout(entry.retryTimer)
     if (entry.progressTimer) clearTimeout(entry.progressTimer)
+    this.clearRunTimers(entry)
+    if (!paused && (cancelled || entry.cancelRequested || error || entry.error)) this.cancelChildren(entry)
 
     const run = this.store.getRun(runId)
     if (!run) return
@@ -665,7 +1123,8 @@ export class AuditRunner {
           : 'completed'
     const progress = {
       ...entry.progress,
-      done: entry.donePrompts.length,
+      retry: null,
+      done: Math.max(entry.donePrompts.length, entry.progress.done ?? 0),
       findings: findingsCount,
       percent: status === 'completed' ? 100 : entry.progress.percent ?? 0,
       stage: status === 'paused'
@@ -682,6 +1141,13 @@ export class AuditRunner {
         300,
       ),
       updatedAt: nowIso(),
+    }
+    if (progress.subagents) {
+      progress.subagents = {
+        ...progress.subagents,
+        running: paused ? progress.subagents.running : 0,
+        queued: 0,
+      }
     }
 
     if (paused) {
@@ -728,6 +1194,63 @@ export class AuditRunner {
 
     // Keep the conversation in the sidebar instead of disposing the session.
     if (!paused) this.retainSession(entry, task, run)
+  }
+
+  /**
+   * Finalize a persisted run whose in-memory session no longer exists (plugin
+   * restarted, host crashed). Without this the record stays "running" forever
+   * and every cancel/pause attempt fails.
+   */
+  finalizeOrphanRun(runId, { status = 'cancelled', note = '运行已结束' } = {}) {
+    const run = this.store.getRun(runId)
+    if (!run) return false
+    if (run.status !== 'running' && run.status !== 'paused') return false
+    if (this.active.has(runId) || this.paused.has(runId)) return false
+    const progress = {
+      ...(run.progress ?? {}),
+      stage: status === 'paused' ? '已暂停' : status === 'failed' ? '失败' : '已取消',
+      note,
+      retry: null,
+      updatedAt: nowIso(),
+    }
+    if (progress.subagents) progress.subagents = { ...progress.subagents, running: 0, queued: 0 }
+    this.store.updateRun(runId, {
+      status,
+      finished_at: status === 'paused' ? null : nowIso(),
+      error: status === 'failed' ? note : null,
+      progress,
+    })
+    const task = this.store.getTask(run.task_id)
+    if (task) {
+      if (status === 'paused') {
+        this.store.updateTask(task.id, { status: 'paused' })
+      } else if (task.schedule_type !== 'manual' && task.enabled) {
+        const next = rescheduleAfterRun(task)
+        this.store.updateTask(task.id, { ...next, status: next.next_run_at ? 'scheduled' : status })
+      } else {
+        this.store.updateTask(task.id, { status, next_run_at: null })
+      }
+    }
+    return true
+  }
+
+  /** Mark running records left over from a previous process as failed. */
+  reconcileOrphanedRuns() {
+    let runs = []
+    try {
+      runs = this.store.activeRuns()
+    } catch {
+      return 0
+    }
+    let count = 0
+    for (const run of runs) {
+      if (this.active.has(run.id) || this.paused.has(run.id)) continue
+      if (this.finalizeOrphanRun(run.id, {
+        status: 'failed',
+        note: '插件重启导致审计中断，请重新运行',
+      })) count += 1
+    }
+    return count
   }
 
   /** Close the record of a paused run that was cancelled instead of resumed. */
@@ -781,6 +1304,8 @@ export class AuditRunner {
     for (const [runId, entry] of this.active) {
       if (entry.retryTimer) clearTimeout(entry.retryTimer)
       if (entry.progressTimer) clearTimeout(entry.progressTimer)
+      this.clearRunTimers(entry)
+      this.cancelChildren(entry)
       try {
         entry.handle.agent.cancel({ kind: 'disposed' })
       } catch {
@@ -799,6 +1324,8 @@ export class AuditRunner {
     }
     this.active.clear()
     for (const [runId, entry] of this.paused) {
+      this.clearRunTimers(entry)
+      this.cancelChildren(entry)
       try {
         entry.handle.dispose()
       } catch {
@@ -820,6 +1347,7 @@ export class AuditRunner {
     }
     this.retained = []
     this.sessionRuns.clear()
+    this.childRuns.clear()
   }
 }
 
@@ -835,6 +1363,20 @@ function RetryCount(value) {
   const count = Number(value)
   if (!Number.isFinite(count) || count <= 0) return 0
   return Math.min(100, Math.floor(count))
+}
+
+/** Concurrent sub-agent limit for one parent conversation. */
+function Concurrency(value) {
+  const count = Number(value)
+  if (!Number.isFinite(count) || count <= 0) return 1
+  return Math.min(20, Math.floor(count))
+}
+
+/** Whether a child session ended because of an error rather than success. */
+function isSubagentFailure(info) {
+  const reason = info?.stopReason ?? info?.lastAssistantMessage?.stopReason
+  if (typeof reason === 'string' && reason) return reason !== 'completed'
+  return /error|fail|abort|timeout|interrupt/i.test(String(reason?.kind ?? reason?.type ?? reason?.reason ?? ''))
 }
 
 /** Session titles are limited to 120 bytes in the client. */
@@ -871,11 +1413,30 @@ function extractMessageText(message) {
 }
 
 /** Compose the single audit instruction sent to the new agent session. */
-export function buildAuditPrompt(task, prompts) {
+export function buildAuditPrompt(task, prompts, options = {}) {
   const sections = prompts.map((prompt, index) => {
     const label = `${index + 1}. ${prompt.name}（分类：${prompt.category || '未分类'}，默认级别：${prompt.default_severity}）`
     return `### ${label}\n${prompt.content.trim()}`
   })
+  const subagentAudit = Boolean(options.subagentAudit)
+  const config = options.subagentConfig ?? {}
+  const limit = Number(config.maxConcurrent) || 3
+  const progressSection = subagentAudit
+    ? `# 子 agent 分工（必须遵守）
+- 本次开启多子 agent 审计：每个漏洞类型单独创建 1 个子 agent 审计，不要由主对话自己逐个类型审计。
+- 使用 DSH 的 \`dsh-tool-subagent\` 工具以**前台**方式创建子 agent（不要使用 run_in_background / continuable 等后台模式），主对话保持运行并等待其返回。
+- 并发上限 ${limit}：同一时间最多同时运行 ${limit} 个子 agent；超出的类型排队。每批子 agent 返回后必须立即创建下一批，直到所有类型都创建过，不要提前结束或提交总结。
+- 每个子 agent 的指令必须写明：只审计指定的那一种漏洞类型、只读访问代码、使用相对路径、返回「发现的问题列表 + 审计结论」，并且**不得调用 code_audit_* 插件工具**（所有上报由主对话统一完成）。
+- 主对话负责统一上报：创建子 agent 前调用 \`code_audit_report_progress\`，prompt_name 为该类型名称，status 为 started；子 agent 成功返回后再次调用，status 为 done。
+- 子 agent 失败重试由主对话负责：某个类型的子 agent 失败后，立即重新创建该类型的子 agent 重试一次，不要重试其他已完成的类型。
+- 同一类型两次子 agent 均失败时，调用 \`code_audit_report_progress\` 上报该类型 status 为 failed，note 用一句话说明失败原因；该类型在审计报告中会被标记为「审计失败」，不要再次重试。
+- 若主对话自身失败后被重启，请重新为所有未完成类型创建子 agent；已上报「审计失败」的类型不再重试。
+- 全部类型结束后调用 \`code_audit_submit_summary\`，并在总结中列出审计失败的类型。`
+    : `# 进度上报（必须遵守）
+- 按上面的顺序逐个类型审计，不要跳过。
+- 开始审计某个类型前，调用工具 \`code_audit_report_progress\`，参数 prompt_name 为该类型名称，status 为 started。
+- 完成该类型（无论是否发现问题）后再次调用，status 为 done，note 用一句话说明结果，例如"已检查 12 个文件，未发现符合条件的问题"。
+- 全部类型完成后调用 \`code_audit_submit_summary\`。`
 
   return `你是一名资深代码安全审计工程师，正在执行一个自动化的代码审计任务。
 
@@ -893,11 +1454,7 @@ export function buildAuditPrompt(task, prompts) {
 # 本次启用的漏洞审计提示词
 ${sections.join('\n\n')}
 
-# 进度上报（必须遵守）
-- 按上面的顺序逐个类型审计，不要跳过。
-- 开始审计某个类型前，调用工具 \`code_audit_report_progress\`，参数 prompt_name 为该类型名称，status 为 started。
-- 完成该类型（无论是否发现问题）后再次调用，status 为 done，note 用一句话说明结果，例如"已检查 12 个文件，未发现符合条件的问题"。
-- 全部类型完成后调用 \`code_audit_submit_summary\`。
+${progressSection}
 
 # 上报方式（必须遵守）
 每确认一个漏洞，调用工具 \`code_audit_submit_finding\`，参数含义：

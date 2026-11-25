@@ -1,6 +1,7 @@
 import { resolve } from 'node:path'
 import { createApiHandler } from './api.js'
 import { registerAuditCommand } from './commands.js'
+import { createSessionManager } from './dshsessions.js'
 import { invalidateDshSkills, syncSkillToDsh } from './dshskills.js'
 import { AuditRunner } from './runner.js'
 import { AuditScheduler } from './scheduler.js'
@@ -41,6 +42,15 @@ export function apply(ctx, config = {}) {
 
   ctx.effect(() => ctx.on('session/event', (session, event) => {
     runner.onSessionEvent(session, event)
+  }))
+
+  // Sub-agent audits run as foreground child sessions of the audit agent; the
+  // plugin keeps the run open until every child reports its terminal edge.
+  ctx.effect(() => ctx.on('subagent/start', (info, parent) => {
+    runner.onSubagentStart(info, parent)
+  }))
+  ctx.effect(() => ctx.on('subagent/end', (info, parent) => {
+    runner.onSubagentEnd(info, parent)
   }))
 
   // Models come from the client's configured LLM providers, so the task form
@@ -136,6 +146,14 @@ export function apply(ctx, config = {}) {
   }
 
   const runner = new AuditRunner({ ctx, store, dataDir, config, resolveDefaultModel })
+  // A previous process may have left runs marked "running" with no session
+  // behind them; close those records so cancel/pause stop failing.
+  try {
+    const recovered = runner.reconcileOrphanedRuns()
+    if (recovered) log(`已终止 ${recovered} 个中断的运行记录`)
+  } catch (error) {
+    log(`清理中断运行失败：${error?.message ?? error}`)
+  }
   const scheduler = new AuditScheduler({
     store,
     runner,
@@ -149,7 +167,21 @@ export function apply(ctx, config = {}) {
   // otherwise a deleted skill keeps showing up as a dead `/skill-name` entry.
   const invalidateSkills = () => invalidateDshSkills(ctx)
 
-  const handler = createApiHandler({ store, runner, scheduler, dataDir, listModels, invalidateSkills })
+  const sessionManager = createSessionManager({
+    ctx,
+    dataDir,
+    log,
+    protectedSessions: () => runner.protectedSessionIds(),
+  })
+  const handler = createApiHandler({
+    store,
+    runner,
+    scheduler,
+    dataDir,
+    listModels,
+    invalidateSkills,
+    sessionManager,
+  })
   ctx.inject(['webServer'], webCtx => {
     webCtx.effect(() => webCtx.webServer.register({
       kind: 'prefix',

@@ -45,6 +45,7 @@ const COVERAGE_LABELS = {
   completed: '已完成',
   partial: '部分完成',
   pending: '未审计',
+  failed: '审计失败',
 }
 
 /** Build an exportable audit report for one task. */
@@ -56,7 +57,7 @@ export function buildTaskReport(store, taskId, format = 'markdown', { type = 'st
   if (type === 'skill') return buildSkillReport(store, task, normalized, stamp)
   const runs = store.listRuns(taskId, 200)
   const findings = store.listFindings({ taskId })
-  const coverage = buildCoverage(store, task, findings)
+  const coverage = buildCoverage(store, task, findings, runs[0])
   const meta = buildReportMeta(store, task, runs, findings)
   const baseName = `code-audit-report-${task.id.slice(-6)}-${stamp}`
 
@@ -86,7 +87,11 @@ export function buildTaskReport(store, taskId, format = 'markdown', { type = 'st
 }
 
 /** Per-type audit coverage so partial runs still export clear empty sections. */
-function buildCoverage(store, task, findings) {
+function buildCoverage(store, task, findings, latestRun) {
+  // A type whose sub-agent exhausted its retries is reported as 审计失败.
+  const typeStates = new Map(
+    (latestRun?.progress?.types ?? []).map(item => [String(item?.name ?? ''), item]),
+  )
   const taskState = task.status === 'running'
     ? 'running'
     : task.status === 'completed'
@@ -130,6 +135,19 @@ function buildCoverage(store, task, findings) {
   const prompts = task.prompt_ids.map(id => store.getPrompt(id)).filter(Boolean)
   return prompts.map(prompt => {
     const count = findings.filter(finding => finding.prompt_id === prompt.id).length
+    const typeState = typeStates.get(prompt.name)
+    if (typeState?.status === 'failed') {
+      return {
+        id: prompt.id,
+        name: prompt.name,
+        category: prompt.category || '',
+        severity: prompt.default_severity,
+        findings: count,
+        state: 'failed',
+        stateLabel: COVERAGE_LABELS.failed,
+        note: typeState.note || '两次子 agent 审计均失败',
+      }
+    }
     let state = taskState
     if (taskState === 'running' && count > 0) state = 'partial'
     return {

@@ -245,7 +245,7 @@ export async function registerAuditTools(ctx, { store, runner, dataDir, log = ()
 
   register(defineTool({
     name: 'code_audit_report_progress',
-    description: '在代码审计过程中上报当前进度：开始或完成某个漏洞类型（或 Skill 审计）。控制台用这些上报显示扫描进度。',
+    description: '在代码审计过程中上报当前进度：开始、完成或失败某个漏洞类型（或 Skill 审计）。控制台用这些上报显示扫描进度。',
     parameters: {
       prompt_name: {
         type: 'string',
@@ -254,8 +254,8 @@ export async function registerAuditTools(ctx, { store, runner, dataDir, log = ()
       },
       status: {
         type: 'string',
-        enum: ['started', 'done'],
-        description: 'started 开始审计该类型，done 已完成该类型',
+        enum: ['started', 'done', 'failed'],
+        description: 'started 开始审计该类型，done 已完成该类型，failed 表示该类型子 agent 两次审计均失败',
         required: true,
       },
       note: { type: 'string', description: '一句话进度说明，例如已检查的文件数量与结果' },

@@ -59,6 +59,13 @@ function validateTaskFields(store, input, current) {
   const enabled = input.enabled === undefined ? (current.enabled ?? true) : Boolean(input.enabled)
   const provider = String(input.provider ?? current.provider ?? '').trim()
   const model = String(input.model ?? current.model ?? '').trim()
+  // Sub-agent audits only exist for the prompt mode; a Skill is the sole
+  // authority for how it audits, so the flag is forced off there.
+  const subagentAudit = auditMode === 'skill'
+    ? false
+    : input.subagent_audit === undefined
+      ? Boolean(current.subagent_audit)
+      : Boolean(input.subagent_audit)
 
   return {
     name,
@@ -67,6 +74,7 @@ function validateTaskFields(store, input, current) {
     prompt_ids: promptIds,
     audit_mode: auditMode,
     skill_id: skillId,
+    subagent_audit: subagentAudit,
     enabled,
     provider,
     model,
@@ -143,6 +151,7 @@ export function buildState(store, { dataDir, maxConcurrentRuns } = {}) {
       maxConcurrentRuns,
       defaultProvider: '',
       defaultModel: '',
+      subagentMaxConcurrent: 3,
     }),
     severities: SEVERITIES,
   }

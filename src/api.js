@@ -26,10 +26,10 @@ const STATIC_FILES = {
 }
 
 /** Create the HTTP handler for the console and its REST API. */
-export function createApiHandler({ store, runner, scheduler, dataDir, listModels, invalidateSkills = () => {} }) {
+export function createApiHandler({ store, runner, scheduler, dataDir, listModels, sessionManager, invalidateSkills = () => {} }) {
   const reportsDir = join(dataDir, 'reports')
   mkdirSync(reportsDir, { recursive: true })
-  const context = { store, runner, scheduler, dataDir, reportsDir, listModels, invalidateSkills }
+  const context = { store, runner, scheduler, dataDir, reportsDir, listModels, sessionManager, invalidateSkills }
 
   return async function handleRequest(req, res) {
     try {
@@ -111,28 +111,57 @@ async function handleApi(req, res, url, route, context) {
   if (resource === 'settings') {
     if (method === 'PUT') {
       const body = await readJsonBody(req)
+      // Validate every submitted field before writing anything, so an invalid
+      // value cannot leave the settings half-updated.
+      const updates = []
       if (body.maxConcurrentRuns !== undefined) {
         const value = Number(body.maxConcurrentRuns)
         if (!Number.isFinite(value) || value <= 0) throw httpError(400, '最大并发数必须为正整数')
-        store.setSetting('maxConcurrentRuns', Math.floor(value))
+        updates.push(['maxConcurrentRuns', Math.floor(value)])
       }
       if (body.llmRetryDelayMinutes !== undefined) {
         const value = Number(body.llmRetryDelayMinutes)
         if (!Number.isFinite(value) || value < 0 || value > 1440) throw httpError(400, '自动续跑间隔必须为 0–1440 分钟')
-        store.setSetting('llmRetryDelayMinutes', Math.floor(value))
+        updates.push(['llmRetryDelayMinutes', Math.floor(value)])
       }
       if (body.llmRetryCount !== undefined) {
         const value = Number(body.llmRetryCount)
         if (!Number.isFinite(value) || value < 0 || value > 100) throw httpError(400, '自动续跑次数必须为 0–100')
-        store.setSetting('llmRetryCount', Math.floor(value))
+        updates.push(['llmRetryCount', Math.floor(value)])
       }
-      if (body.defaultProvider !== undefined) store.setSetting('defaultProvider', String(body.defaultProvider).trim())
-      if (body.defaultModel !== undefined) store.setSetting('defaultModel', String(body.defaultModel).trim())
+      if (body.subagentMaxConcurrent !== undefined) {
+        const value = Number(body.subagentMaxConcurrent)
+        if (!Number.isFinite(value) || value < 1 || value > 20) throw httpError(400, '子 agent 并发上限必须为 1–20')
+        updates.push(['subagentMaxConcurrent', Math.floor(value)])
+      }
+      if (body.defaultProvider !== undefined) updates.push(['defaultProvider', String(body.defaultProvider).trim()])
+      if (body.defaultModel !== undefined) updates.push(['defaultModel', String(body.defaultModel).trim()])
+      for (const [key, value] of updates) store.setSetting(key, value)
       sendJson(res, 200, { settings: store.allSettings() })
       return
     }
     if (method === 'GET') {
       sendJson(res, 200, { settings: store.allSettings() })
+      return
+    }
+  }
+
+  if (resource === 'sessions') {
+    const manager = context.sessionManager
+    if (!manager) throw httpError(503, '当前 DSH 版本不支持会话管理')
+    if (method === 'GET' && segments.length === 1) {
+      const view = url.searchParams.get('view') === 'archived' ? 'archived' : 'active'
+      sendJson(res, 200, { view, sessions: await manager.list({ view }) })
+      return
+    }
+    if (method === 'POST' && segments.length === 2) {
+      const action = segments[1]
+      if (!['archive', 'restore', 'delete'].includes(action)) throw httpError(404, '接口不存在')
+      const body = await readJsonBody(req)
+      const ids = Array.isArray(body.ids) ? body.ids.map(String).filter(Boolean) : []
+      if (ids.length === 0) throw httpError(400, '请选择要操作的会话')
+      const actionMethod = action === 'delete' ? 'remove' : action
+      sendJson(res, 200, { results: await manager[actionMethod](ids) })
       return
     }
   }
@@ -164,6 +193,11 @@ async function handleTasks(req, res, url, segments, context) {
   }
   if (method === 'DELETE' && segments.length === 2) {
     if (!store.getTask(id)) throw httpError(404, '审计任务不存在')
+    // Deleting cascades runs and findings, which would break a live audit.
+    if (store.activeRuns().some(run => run.task_id === id)) {
+      throw httpError(409, '任务正在运行，请先取消运行后再删除')
+    }
+    if (runner.pausedRun(id)) throw httpError(409, '任务处于暂停状态，请先取消后再删除')
     runner.discardPaused(id)
     store.deleteTask(id)
     sendJson(res, 200, { deleted: true })

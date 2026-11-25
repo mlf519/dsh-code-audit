@@ -116,6 +116,7 @@ export class AuditStore {
     this.ensureColumn('findings', 'skill_id', "TEXT NOT NULL DEFAULT ''")
     this.ensureColumn('tasks', 'audit_mode', "TEXT NOT NULL DEFAULT 'prompts'")
     this.ensureColumn('tasks', 'skill_id', "TEXT NOT NULL DEFAULT ''")
+    this.ensureColumn('tasks', 'subagent_audit', 'INTEGER NOT NULL DEFAULT 0')
     this.ensureColumn('skills', 'skill_md', "TEXT NOT NULL DEFAULT ''")
     this.ensureColumn('skills', 'references_json', "TEXT NOT NULL DEFAULT '[]'")
     this.ensureColumn('skills', 'manifest_json', "TEXT NOT NULL DEFAULT '{}'")
@@ -216,7 +217,18 @@ export class AuditStore {
 
   deletePrompt(id) {
     const result = this.db.prepare('DELETE FROM prompts WHERE id = ?').run(id)
-    return result.changes > 0
+    if (result.changes === 0) return false
+    // Drop stale references so task runs and coverage reports do not silently
+    // lose a vulnerability type.
+    const stamp = nowIso()
+    const rows = this.db.prepare('SELECT id, prompt_ids FROM tasks').all()
+    for (const row of rows) {
+      const ids = parseJson(row.prompt_ids, [])
+      if (!Array.isArray(ids) || !ids.includes(id)) continue
+      this.db.prepare('UPDATE tasks SET prompt_ids = ?, updated_at = ? WHERE id = ?')
+        .run(JSON.stringify(ids.filter(promptId => promptId !== id)), stamp, row.id)
+    }
+    return true
   }
 
   /** Insert or update a prompt by name; used by YAML import. */
@@ -339,9 +351,10 @@ export class AuditStore {
     const stamp = nowIso()
     const id = newId('t')
     this.db.prepare(
-      `INSERT INTO tasks (id, name, repo_path, description, prompt_ids, audit_mode, skill_id, status, schedule_type,
-        schedule_at, schedule_cron, interval_minutes, next_run_at, enabled, provider, model, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO tasks (id, name, repo_path, description, prompt_ids, audit_mode, skill_id, subagent_audit,
+        status, schedule_type, schedule_at, schedule_cron, interval_minutes, next_run_at, enabled, provider, model,
+        created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       id,
       input.name,
@@ -350,6 +363,7 @@ export class AuditStore {
       JSON.stringify(input.prompt_ids ?? []),
       input.audit_mode === 'skill' ? 'skill' : 'prompts',
       input.skill_id ?? '',
+      input.subagent_audit ? 1 : 0,
       input.status ?? 'draft',
       input.schedule_type ?? 'manual',
       input.schedule_at ?? null,
@@ -371,8 +385,8 @@ export class AuditStore {
     const next = { ...current, ...patch }
     this.db.prepare(
       `UPDATE tasks SET name = ?, repo_path = ?, description = ?, prompt_ids = ?, audit_mode = ?, skill_id = ?,
-        status = ?, schedule_type = ?, schedule_at = ?, schedule_cron = ?, interval_minutes = ?, next_run_at = ?,
-        enabled = ?, provider = ?, model = ?, updated_at = ?, last_run_at = ?
+        subagent_audit = ?, status = ?, schedule_type = ?, schedule_at = ?, schedule_cron = ?, interval_minutes = ?,
+        next_run_at = ?, enabled = ?, provider = ?, model = ?, updated_at = ?, last_run_at = ?
        WHERE id = ?`,
     ).run(
       next.name,
@@ -381,6 +395,7 @@ export class AuditStore {
       JSON.stringify(next.prompt_ids ?? []),
       next.audit_mode === 'skill' ? 'skill' : 'prompts',
       next.skill_id ?? '',
+      next.subagent_audit ? 1 : 0,
       next.status ?? 'draft',
       next.schedule_type ?? 'manual',
       next.schedule_at ?? null,
@@ -665,6 +680,7 @@ export class AuditStore {
       prompt_ids: parseJson(row.prompt_ids, []),
       audit_mode: row.audit_mode === 'skill' ? 'skill' : 'prompts',
       skill_id: row.skill_id ?? '',
+      subagent_audit: Boolean(row.subagent_audit),
       status: row.status,
       schedule_type: row.schedule_type,
       schedule_at: row.schedule_at,
